@@ -1,0 +1,4 @@
+Flask
+flask-socketio
+flask-httpauth
+python-socketio
