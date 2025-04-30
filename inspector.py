@@ -11,7 +11,7 @@ import matplotlib.pyplot as plt
 ACK_HEX = b'007f007f'  # Cobra’s 4-byte ACK
 
 def create_setup_message(sample_quantity: int, time_range: int) -> str:
-    # same as before…
+    # … same as before …
     m_N       = ' '
     m_00      = '1'
     m_01      = '1'
@@ -54,9 +54,13 @@ def create_setup_message(sample_quantity: int, time_range: int) -> str:
     )
 
 def read_one_trace(sock, sample_quantity):
-    """Read one trace of data and return as 1D numpy array."""
+    """
+    Read one trace: sample_quantity-(sample_quantity/16) ints, then skip service bytes.
+    Returns a 1D numpy array.
+    """
     service_sz = sample_quantity // 16
     sample_sz  = sample_quantity - service_sz
+
     buf = []
     for _ in range(sample_sz):
         b = sock.recv(2)
@@ -68,13 +72,13 @@ def read_one_trace(sock, sample_quantity):
     return np.array(buf, dtype=np.int16)
 
 def main():
-    p = argparse.ArgumentParser("Live GPR B-scan (scrolling)")
+    p = argparse.ArgumentParser("Live GPR B-scan (scroll L→R)")
     p.add_argument('--host',    required=True, help="GPR IP")
     p.add_argument('--port',    type=int, default=23, help="GPR port")
     p.add_argument('--quantity',type=int, default=512, help="sampleQuantity")
     p.add_argument('--range',   type=int, default=100, help="timeRange (ns)")
     p.add_argument('--window',  type=int, default=200,
-                   help="number of traces to show across")
+                   help="traces across the screen")
     args = p.parse_args()
 
     # connect & setup
@@ -92,7 +96,7 @@ def main():
         sys.exit(1)
     print("[+] Streaming… close the window to stop")
 
-    # prepare buffer and plot
+    # prepare buffer & plot
     service_sz = args.quantity // 16
     sample_sz  = args.quantity - service_sz
     data = np.zeros((sample_sz, args.window), dtype=np.int16)
@@ -113,16 +117,18 @@ def main():
     try:
         while plt.fignum_exists(fig.number):
             trace = read_one_trace(sock, args.quantity)
-            # shift everything left, drop oldest
-            data = np.roll(data, -1, axis=1)
-            # put new trace on the right
-            data[:, -1] = trace
+
+            # **shift everything right**, drop the oldest on the right edge
+            data = np.roll(data, 1, axis=1)
+            # **put new data on the leftmost column**
+            data[:, 0] = trace
 
             im.set_data(data)
             fig.canvas.draw()
             fig.canvas.flush_events()
+
     except Exception as e:
-        print("Error during streaming:", e, file=sys.stderr)
+        print("Streaming error:", e, file=sys.stderr)
     finally:
         sock.close()
 
