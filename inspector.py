@@ -7,10 +7,10 @@ import binascii
 import numpy as np
 import matplotlib.pyplot as plt
 
-ACK_HEX = b'007f007f'
+ACK_HEX = b'007f007f'  # Cobra’s 4-byte ACK
 
 def create_setup_message(sample_quantity: int, time_range: int) -> str:
-    # same builder as before...
+    # …same T-command builder as before…
     m_N, m_00, m_01 = ' ', '1', '1'
     m_07, m_08_10, m_11_12, m_15 = '0', '000', '00', '0'
     m_16_19, m_20_21, m_22_31 = '1010', '00', '1010110010'
@@ -34,45 +34,45 @@ def create_setup_message(sample_quantity: int, time_range: int) -> str:
     )
 
 def read_one_trace(sock, sample_quantity):
-    service = sample_quantity//16
-    main_n  = sample_quantity - service
-    buf = np.empty(main_n, dtype=np.int16)
+    service_sz = sample_quantity // 16
+    main_n     = sample_quantity - service_sz
+    buf        = np.empty(main_n, dtype=np.int16)
     for i in range(main_n):
         b = sock.recv(2)
-        if len(b)<2: raise IOError("Socket closed")
+        if len(b) < 2:
+            raise IOError("Socket closed")
         buf[i] = int.from_bytes(b, byteorder='big', signed=True)
-    sock.recv(service*2)
+    sock.recv(service_sz*2)
     return buf
 
 def main():
-    p = argparse.ArgumentParser("Live GPR B-scan")
+    p = argparse.ArgumentParser("Live GPR B-scan (scroll L→R)")
     p.add_argument('--host',     required=True, help="GPR IP")
     p.add_argument('--port',     type=int, default=23, help="GPR port")
     p.add_argument('--quantity', type=int, default=512, help="sampleQuantity")
     p.add_argument('--range',    type=int, default=100, help="timeRange (ns)")
-    p.add_argument('--window',   type=int, default=100,
-                   help="number of traces across")
+    p.add_argument('--window',   type=int, default=200, help="traces across screen")
     args = p.parse_args()
 
     # connect & setup
     setup = create_setup_message(args.quantity, args.range)
     try:
-        sock = socket.create_connection((args.host,args.port), timeout=5)
-        sock.sendall((setup+"\n").encode('ascii'))
+        sock = socket.create_connection((args.host, args.port), timeout=5)
+        sock.sendall((setup + "\n").encode('ascii'))
         sock.sendall(b"P1\n")
         ack = sock.recv(4)
-        if binascii.hexlify(ack)!=ACK_HEX:
-            print("Bad ACK",ack,file=sys.stderr); sys.exit(1)
+        if binascii.hexlify(ack) != ACK_HEX:
+            print("Bad ACK:", ack, file=sys.stderr)
+            sys.exit(1)
         sock.recv(1)
     except Exception as e:
-        print("Setup failed:",e,file=sys.stderr); sys.exit(1)
+        print("Setup failed:", e, file=sys.stderr)
+        sys.exit(1)
 
-    # prep buffer & plot
-    service = args.quantity//16
-    main_n  = args.quantity - service
-    data    = np.zeros((main_n, args.window), dtype=np.int16)
-    col     = 0
-    trace_idx = 0
+    # prepare buffer & plot
+    service_sz = args.quantity // 16
+    sample_sz  = args.quantity - service_sz
+    data       = np.zeros((sample_sz, args.window), dtype=np.int16)
 
     plt.ion()
     fig, ax = plt.subplots(figsize=(8,6))
@@ -81,39 +81,31 @@ def main():
         cmap='gray',
         aspect='auto',
         origin='upper',
-        vmin=-32768,
-        vmax=32767
+        vmin=-32768,    # fixed min
+        vmax=32767      # fixed max
     )
     ax.set_xlabel("Trace #")
     ax.set_ylabel("Sample (time→depth)")
-    ax.set_title("Live GPR B-scan (close to stop)")
-    cbar = fig.colorbar(im, ax=ax)
-    cbar.set_label("Amplitude")
-
-    # set x-ticks at left, mid, right
-    ticks = [0, args.window//2, args.window-1]
-    ax.set_xticks(ticks)
+    ax.set_title("Live GPR B-scan")
+    fig.colorbar(im, ax=ax, label="Amplitude")
 
     try:
         while plt.fignum_exists(fig.number):
             trace = read_one_trace(sock, args.quantity)
-            data[:, col] = trace
-            trace_idx += 1
-            col = (col+1) % args.window
+
+            # shift right, drop oldest
+            data = np.roll(data, 1, axis=1)
+            # put new trace at left edge
+            data[:, 0] = trace
 
             im.set_data(data)
-            # label x-ticks with absolute trace numbers
-            start = trace_idx - args.window + 1
-            labels = [max(0, start + t) for t in ticks]
-            ax.set_xticklabels(labels)
-
             fig.canvas.draw()
             fig.canvas.flush_events()
 
     except Exception as e:
-        print("Error:",e,file=sys.stderr)
+        print("Streaming error:", e, file=sys.stderr)
     finally:
         sock.close()
 
-if __name__=='__main__':
+if __name__ == '__main__':
     main()
