@@ -1,64 +1,57 @@
+#!/usr/bin/env python3
+import argparse
 import time
-import gc
-import threading
+from pymavlink import mavutil
 
-from flask import Flask
-from flask_socketio import SocketIO
-from inspector import Inspector  # local file
-
-app = Flask(__name__)
-app.config['SECRET_KEY'] = 'secret!'
-socketio = SocketIO(app, async_mode='threading')
-
-# init Inspector from inspector.py
-inspector = Inspector(socketio=socketio, debug=True)
-inspector.socketio_emitter = lambda data: socketio.emit(data['event'], data['payload'])
-inspector.create_project('Default')
-inspector.set_project('Default')
-gc.enable()
-
-@socketio.on('start_gpr')
-def handle_start_gpr(msg):
-    # start GPR scan on the Cobra unit
-    inspector.is_gpr_logging = True
-    inspector.gpr.run(
-        sample_quantity=msg['sampleQuantity'],
-        depth_index=msg['depthIndex'],
-        frequency=msg['scanningFrequency'],
-        gps_latest_message=inspector.gps.latest_message,
-        gps_lock=inspector.gps.gps_lock,
-        lidar_latest_message=inspector.lidar.latest_message,
-        lidar_lock=inspector.lidar.lidar_lock
+def main():
+    p = argparse.ArgumentParser(
+        description="Read Pixhawk 6X rangefinder via MAVLink"
     )
-    inspector.stop_gpr = False
+    p.add_argument('--connect', required=True,
+                   help="MAVLink connection string, e.g. /dev/ttyTHS1,57600 or udp:0.0.0.0:14550")
+    p.add_argument('--rate', type=int, default=10,
+                   help="Desired update rate in Hz for DISTANCE_SENSOR")
+    args = p.parse_args()
 
-    # collect scans in a background thread
-    def collect():
-        while not inspector.stop_gpr:
-            with inspector.gpr_logger_last_700_traces_lock:
-                m = inspector.gpr.queue.get()
-                inspector.gpr_logger_last_700_traces = m['stream']
-                inspector.gpr_logger = m['logger']
-            time.sleep(0.5)
-        # ensure logger is set before exit
-        while inspector.gpr_logger is None:
-            m = inspector.gpr.queue.get()
-            inspector.gpr_logger = m['logger']
+    print(f"[+] Connecting to {args.connect}…")
+    m = mavutil.mavlink_connection(args.connect)
+    # wait for heartbeat
+    m.wait_heartbeat()
+    print("[+] Heartbeat received. Autopilot system %u component %u" %
+          (m.target_system, m.target_component))
 
-    t = threading.Thread(target=collect)
-    t.daemon = True
-    t.start()
+    # Request DISTANCE_SENSOR at args.rate Hz
+    # MAV_CMD_SET_MESSAGE_INTERVAL (180), param1 = msg_id, param2 = interval in µs
+    MSG_ID = mavutil.mavlink.MAVLINK_MSG_ID_DISTANCE_SENSOR  # 132
+    interval_us = int(1e6 / args.rate)
+    m.mav.command_long_send(
+        m.target_system,
+        m.target_component,
+        mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
+        0,
+        MSG_ID,
+        interval_us,
+        0,0,0,0,0
+    )
+    print(f"[+] Requested DISTANCE_SENSOR @ {args.rate} Hz")
 
-@socketio.on('get_raw_gpr')
-def handle_get_raw(msg):
-    # wait up to 5s for data
-    deadline = time.time() + 5
-    while not inspector.gpr_logger_last_700_traces and time.time() < deadline:
-        time.sleep(0.1)
-    count = msg.get('count', len(inspector.gpr_logger_last_700_traces))
-    data = inspector.gpr_logger_last_700_traces[-count:]
-    socketio.emit('raw_gpr_data', data)
+    try:
+        while True:
+            # Blocking wait for next DISTANCE_SENSOR
+            msg = m.recv_match(type='DISTANCE_SENSOR', blocking=True, timeout=5)
+            if msg is None:
+                print("[!] No DISTANCE_SENSOR in 5 s, retrying…")
+                continue
+            # Fields per MAVLink common spec :contentReference[oaicite:0]{index=0}
+            dist_cm = msg.distance        # uint16_t in cm
+            min_cm  = msg.min_distance    # minimum sensor range
+            max_cm  = msg.max_distance    # maximum sensor range
+            ori     = msg.orientation     # sensor orientation :contentReference[oaicite:1]{index=1}
+            print(f"Distance: {dist_cm} cm  (range: {min_cm}–{max_cm} cm)  orientation: {ori}")
+    except KeyboardInterrupt:
+        print("\n[*] Interrupted by user, exiting.")
+    finally:
+        m.close()
 
-if __name__ == '__main__':
-    # listens on port 5000
-    socketio.run(app, host='0.0.0.0', port=23, debug=False)
+if __name__ == "__main__":
+    main()
