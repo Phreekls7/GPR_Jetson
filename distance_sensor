@@ -3,22 +3,29 @@ from PyQt5.QtWidgets import QApplication, QWidget, QLabel, QVBoxLayout
 from rclpy.node import Node
 import rclpy
 
-from px4_msgs.msg import DistanceSensor  # Make sure this message type is correct
+from px4_msgs.msg import DistanceSensor  # Change if you're using a different message
+from rclpy.qos import QoSProfile, ReliabilityPolicy
 
 class DistanceDisplay(Node):
     def __init__(self, label):
         super().__init__('distance_display_node')
         self.label = label
+
+        # Use QoS settings that match PX4's best effort publisher
+        qos_profile = QoSProfile(depth=10)
+        qos_profile.reliability = ReliabilityPolicy.BEST_EFFORT
+
         self.subscription = self.create_subscription(
             DistanceSensor,
             '/fmu/out/distance_sensor',
             self.listener_callback,
-            10
+            qos_profile
         )
 
     def listener_callback(self, msg):
         distance = msg.current_distance
         self.label.setText(f"Current Distance: {distance:.2f} meters")
+        print(f"Received distance: {distance:.2f} meters")  # Optional debug
 
 class App(QWidget):
     def __init__(self):
@@ -42,7 +49,7 @@ def main():
     app = QApplication(sys.argv)
     ex = App()
     ex.show()
-    
+
     timer = app.timer = ex.startTimer(100)
     def update_ros():
         rclpy.spin_once(ex.node, timeout_sec=0.1)
