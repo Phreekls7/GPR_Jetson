@@ -1,61 +1,30 @@
-import sys
-from PyQt5.QtWidgets import QApplication, QWidget, QLabel, QVBoxLayout
-from rclpy.node import Node
 import rclpy
-
-from px4_msgs.msg import DistanceSensor  # Change if you're using a different message
+from rclpy.node import Node
+from px4_msgs.msg import DistanceSensor  # or change this to match your topic
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 
-class DistanceDisplay(Node):
-    def __init__(self, label):
-        super().__init__('distance_display_node')
-        self.label = label
+class DebugSub(Node):
+    def __init__(self):
+        super().__init__('debug_subscriber')
+        qos = QoSProfile(depth=10)
+        qos.reliability = ReliabilityPolicy.BEST_EFFORT
 
-        # Use QoS settings that match PX4's best effort publisher
-        qos_profile = QoSProfile(depth=10)
-        qos_profile.reliability = ReliabilityPolicy.BEST_EFFORT
-
-        self.subscription = self.create_subscription(
+        self.create_subscription(
             DistanceSensor,
             '/fmu/out/distance_sensor',
-            self.listener_callback,
-            qos_profile
+            self.callback,
+            qos
         )
 
-    def listener_callback(self, msg):
-        distance = msg.current_distance
-        self.label.setText(f"Current Distance: {distance:.2f} meters")
-        print(f"Received distance: {distance:.2f} meters")  # Optional debug
+    def callback(self, msg):
+        self.get_logger().info(f'Received: {msg.current_distance:.2f} meters')
 
-class App(QWidget):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("Distance Sensor Display")
-        self.setGeometry(100, 100, 300, 100)
-
-        self.layout = QVBoxLayout()
-        self.label = QLabel("Waiting for data...")
-        self.layout.addWidget(self.label)
-        self.setLayout(self.layout)
-
-        rclpy.init()
-        self.node = DistanceDisplay(self.label)
-
-    def closeEvent(self, event):
-        self.node.destroy_node()
-        rclpy.shutdown()
-
-def main():
-    app = QApplication(sys.argv)
-    ex = App()
-    ex.show()
-
-    timer = app.timer = ex.startTimer(100)
-    def update_ros():
-        rclpy.spin_once(ex.node, timeout_sec=0.1)
-    app.timerEvent = lambda e: update_ros()
-
-    sys.exit(app.exec_())
+def main(args=None):
+    rclpy.init(args=args)
+    node = DebugSub()
+    rclpy.spin(node)
+    node.destroy_node()
+    rclpy.shutdown()
 
 if __name__ == '__main__':
     main()
