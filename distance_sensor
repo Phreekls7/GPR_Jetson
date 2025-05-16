@@ -1,0 +1,54 @@
+import sys
+from PyQt5.QtWidgets import QApplication, QWidget, QLabel, QVBoxLayout
+from rclpy.node import Node
+import rclpy
+
+from px4_msgs.msg import DistanceSensor  # Make sure this message type is correct
+
+class DistanceDisplay(Node):
+    def __init__(self, label):
+        super().__init__('distance_display_node')
+        self.label = label
+        self.subscription = self.create_subscription(
+            DistanceSensor,
+            '/fmu/out/distance_sensor',
+            self.listener_callback,
+            10
+        )
+
+    def listener_callback(self, msg):
+        distance = msg.current_distance
+        self.label.setText(f"Current Distance: {distance:.2f} meters")
+
+class App(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Distance Sensor Display")
+        self.setGeometry(100, 100, 300, 100)
+
+        self.layout = QVBoxLayout()
+        self.label = QLabel("Waiting for data...")
+        self.layout.addWidget(self.label)
+        self.setLayout(self.layout)
+
+        rclpy.init()
+        self.node = DistanceDisplay(self.label)
+
+    def closeEvent(self, event):
+        self.node.destroy_node()
+        rclpy.shutdown()
+
+def main():
+    app = QApplication(sys.argv)
+    ex = App()
+    ex.show()
+    
+    timer = app.timer = ex.startTimer(100)
+    def update_ros():
+        rclpy.spin_once(ex.node, timeout_sec=0.1)
+    app.timerEvent = lambda e: update_ros()
+
+    sys.exit(app.exec_())
+
+if __name__ == '__main__':
+    main()
