@@ -1,30 +1,65 @@
+import sys
+from PyQt5.QtWidgets import QApplication, QWidget, QLabel, QVBoxLayout
+from PyQt5.QtCore import QTimer
 import rclpy
 from rclpy.node import Node
-from px4_msgs.msg import DistanceSensor  # or change this to match your topic
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 
-class DebugSub(Node):
-    def __init__(self):
-        super().__init__('debug_subscriber')
-        qos = QoSProfile(depth=10)
-        qos.reliability = ReliabilityPolicy.BEST_EFFORT
+from px4_msgs.msg import DistanceSensor  # Make sure this matches your setup
 
-        self.create_subscription(
+class DistanceDisplay(Node):
+    def __init__(self, label):
+        super().__init__('distance_display_node')
+        self.label = label
+
+        qos_profile = QoSProfile(depth=10)
+        qos_profile.reliability = ReliabilityPolicy.BEST_EFFORT
+
+        self.subscription = self.create_subscription(
             DistanceSensor,
             '/fmu/out/distance_sensor',
-            self.callback,
-            qos
+            self.listener_callback,
+            qos_profile
         )
 
-    def callback(self, msg):
-        self.get_logger().info(f'Received: {msg.current_distance:.2f} meters')
+    def listener_callback(self, msg):
+        distance = msg.current_distance
+        self.label.setText(f"Current Distance: {distance:.2f} meters")
+        print(f"[ROS2] Received: {distance:.2f} meters")
 
-def main(args=None):
-    rclpy.init(args=args)
-    node = DebugSub()
-    rclpy.spin(node)
-    node.destroy_node()
-    rclpy.shutdown()
+class App(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Distance Sensor Display")
+        self.setGeometry(100, 100, 300, 100)
+
+        # Layout
+        self.layout = QVBoxLayout()
+        self.label = QLabel("Waiting for data...")
+        self.layout.addWidget(self.label)
+        self.setLayout(self.layout)
+
+        # Init ROS2 node
+        rclpy.init()
+        self.node = DistanceDisplay(self.label)
+
+        # Setup QTimer to call ROS2 spin
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.spin_ros_once)
+        self.timer.start(100)  # Every 100 ms
+
+    def spin_ros_once(self):
+        rclpy.spin_once(self.node, timeout_sec=0.01)
+
+    def closeEvent(self, event):
+        self.node.destroy_node()
+        rclpy.shutdown()
+
+def main():
+    app = QApplication(sys.argv)
+    window = App()
+    window.show()
+    sys.exit(app.exec_())
 
 if __name__ == '__main__':
     main()
