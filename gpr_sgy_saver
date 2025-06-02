@@ -1,0 +1,190 @@
+#!/usr/bin/env python3
+import threading
+import numpy as np
+import segyio
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import Image
+from cv_bridge import CvBridge
+
+
+class GPRSegySaver(Node):
+    """
+    Subscribes to /gpr/bscan (sensor_msgs/Image, mono8),
+    recovers int16 traces, accumulates them, and writes a SEG-Y file on shutdown.
+    """
+
+    def __init__(self):
+        super().__init__('gpr_segy_saver')
+
+        # 1) Parameters (must match your publisher exactly)
+        self.quantity = 1024
+        svc = self.quantity // 16
+        self.n_samples = self.quantity - svc      # e.g. 1024 - 64 = 960
+        self.window_cols = 1000                   # same as publisher → sliding window width
+
+        # 2) CvBridge for image ↔ numpy conversion
+        self.bridge = CvBridge()
+
+        # 3) Subscribe to /gpr/bscan
+        self.subscription = self.create_subscription(
+            Image,
+            '/gpr/bscan',
+            self.image_callback,
+            10
+        )
+        self.subscription  # prevent unused‐variable warning
+
+        # 4) Storage for accumulated traces
+        self.accumulated_traces = []  # list of 1D np.int16 arrays, each length = n_samples
+        self.lock = threading.Lock()
+
+        # 5) Track how many columns we've already taken from the rolling window
+        self.columns_taken = 0
+
+        self.get_logger().info(
+            f"Subscribed to /gpr/bscan → expecting {self.n_samples} samples/trace, "
+            f"{self.window_cols} columns/window."
+        )
+
+        # 6) Register on_shutdown callback so we write SEG-Y when node shuts down
+        self.add_on_shutdown(self.on_shutdown)
+
+    def image_callback(self, msg: Image):
+        """
+        Called each time a new /gpr/bscan Image arrives.
+        Convert to NumPy, recover int16, extract only new columns, and append them.
+        """
+        # 1) Convert ROS Image → cv2 (uint8) numpy array
+        try:
+            uchar_img = self.bridge.imgmsg_to_cv2(msg, desired_encoding='mono8')
+        except Exception as e:
+            self.get_logger().error(f"CVBridge error: {e}")
+            return
+
+        h, w = uchar_img.shape
+        if h != self.n_samples or w != self.window_cols:
+            self.get_logger().warn(
+                f"Unexpected image size: got ({h}×{w}), expected ({self.n_samples}×{self.window_cols})"
+            )
+            # We can still attempt to process, but shape mismatch may lead to errors.
+            return
+
+        # 2) Recover int16 from uint8 using inverse of publisher’s scaling:
+        #    int16 ≈ round( (uint8 * (65535/255)) - 32768 )
+        img_int32 = uchar_img.astype(np.int32)
+        recovered = (img_int32 * (65535.0 / 255.0)) - 32768.0
+        recovered = np.round(recovered).astype(np.int16)  # shape (n_samples, window_cols)
+
+        # 3) Determine how many columns are truly “new” (not previously saved)
+        #    On the first callback, columns_taken = 0 → take all w columns.
+        #    After that, each new image overlaps with previous by (w - 1) columns,
+        #    so typically new_cols = 1. If frames get dropped, new_cols may be >1.
+        if self.columns_taken == 0:
+            new_cols = w
+        else:
+            # of the w columns in this image, the first (w - 1) were in the last image.
+            # So only the last column is guaranteed brand-new. However, if the node
+            # missed some images, you might have 2 or more brand-new columns. We can
+            # compute:
+            new_cols = w - (self.columns_taken % w)
+
+        if new_cols <= 0:
+            # No new columns to take (rare unless frame‐dropping logic is odd). Skip.
+            return
+
+        # 4) Slice out the new columns from the right side:
+        #    recovered[:, (w - new_cols) : w]
+        new_data = recovered[:, (w - new_cols):w]  # shape = (n_samples, new_cols)
+
+        # 5) Append each new column (trace) to accumulated_traces (thread‐safe)
+        with self.lock:
+            for col_idx in range(new_data.shape[1]):
+                trace_col = new_data[:, col_idx].copy()  # copy to avoid buffer reuse
+                self.accumulated_traces.append(trace_col)
+
+        self.columns_taken += new_cols
+
+        # (Optional) Log every 100 traces:
+        if self.columns_taken % 100 == 0:
+            self.get_logger().info(f"Collected {self.columns_taken} traces so far...")
+
+    def on_shutdown(self):
+        """
+        Called when rclpy is shutting down (Ctrl+C or kill). Write SEG-Y now.
+        """
+        self.get_logger().info("Shutdown initiated → writing SEG-Y file...")
+
+        # Stack all traces into a 2D array of shape (n_samples, n_traces)
+        with self.lock:
+            if len(self.accumulated_traces) == 0:
+                self.get_logger().warn("No traces were collected. Exiting without writing SEG-Y.")
+                return
+            data_mat = np.stack(self.accumulated_traces, axis=1)  # shape: (n_samples, n_traces)
+            n_samples, n_traces = data_mat.shape
+
+        # 1) Prepare a minimal SEG-Y spec
+        spec = segyio.spec()
+        spec.sorting = segyio.SortingLayout.Trace  # each trace is contiguous
+        spec.format = segyio.TraceField.SampleFormat.Int16  # store samples as signed 16-bit
+        spec.samples = np.arange(n_samples)  # dummy sample indices (0..n_samples-1)
+        spec.ilines = np.arange(n_traces)    # each trace gets its own inline number
+        spec.xlines = np.zeros(n_traces, dtype=np.int32)  # all crosslines = 0
+
+        # Filename for output: timestamped
+        import datetime
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_filename = f"gpr_output_{ts}.sgy"
+
+        # 2) Create and write the SEG-Y file
+        with segyio.create(out_filename, spec) as segyfile:
+            # 2a) Textual header (3200 bytes). Fill with basic ASCII info
+            txt = (
+                "C 1 GPR B-Scan SEG-Y file generated by gpr_sgy_saver\n"
+                f"C 2 Number of samples/trace: {n_samples}\n"
+                f"C 3 Number of traces: {n_traces}\n"
+                f"C 4 Sample interval (ns): {100 * 1000 / self.quantity:.2f}\n"
+                # (Adjust sample interval in ns: e.g., if your GPR range=100ns over 1024 samples
+                # then each sample = 100ns/1024 ≈ 0.0977ns). SEG-Y BIN.INTERVAL wants integer µs.
+            )
+            txt = txt.ljust(3200)[:3200]  # pad/truncate to exactly 3200 ASCII chars
+            segyfile.text[0] = txt.encode('ascii', 'replace')
+
+            # 2b) Binary header: set Samples & Interval
+            segyfile.bin = segyfile.bin  # get a reference to the 400-byte binary header
+            segyfile.bin[segyio.BinField.Samples] = n_samples
+            # SEG-Y Interval field expects sample interval in microseconds (integer).
+            # If each sample is, say, 0.1 µs (100 ns), then int(0.1) = 0 => you lose precision.
+            # Common practice is to store “nominal µs” (e.g. 1 µs) and note real interval in textual header.
+            segyfile.bin[segyio.BinField.Interval] = int(round((100.0 / 1024.0) / 1000.0))
+            segyfile.bin[segyio.BinField.Format] = segyio.TraceField.SampleFormat.Int16
+
+            # 2c) Write each trace’s header and data
+            for tr_idx in range(n_traces):
+                # Minimal trace header: only set TRACE_SEQUENCE_LINE
+                hdr = segyfile.header[tr_idx]
+                hdr[segyio.TraceField.TRACE_SEQUENCE_LINE] = tr_idx + 1
+                # Write sample data (length = n_samples). dtype int16 matches spec.format
+                segyfile.trace[tr_idx] = data_mat[:, tr_idx]
+
+        self.get_logger().info(f"SEG-Y file written: {out_filename}")
+
+        # Node can now exit
+        return
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = GPRSegySaver()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        # If ctrl-C or rclpy.shutdown was called, on_shutdown() has already run
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
