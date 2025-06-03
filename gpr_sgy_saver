@@ -1,5 +1,26 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+gpr_sgy_saver.py
+
+A ROS2 node that subscribes to the /gpr/bscan topic (as a sensor_msgs/Image),
+reconstructs each image into a “trace” (np.int16 array), accumulates them,
+and on shutdown writes out a fully GeoLitix-compatible SEG-Y file.
+
+Key points:
+  • Avoid inline/xline overflow by setting them to zero.
+  • Use CDP_X/CDP_Y for 2D geometry and clamp to ±32767.
+  • Write a valid 3200-byte EBCDIC header (CP500).
+  • Use a nonzero Interval (1 µs) and Format=3 (2-byte signed int).
+  • Always write sample data in big-endian (">i2").
+"""
+
+import os
+import sys
 import threading
+import queue
+import datetime
+
 import numpy as np
 import segyio
 import rclpy
@@ -8,230 +29,242 @@ from sensor_msgs.msg import Image
 from cv_bridge import CvBridge
 
 
-class GPRSegySaver(Node):
-    """
-    Subscribes to /gpr/bscan (sensor_msgs/Image, mono8),
-    recovers int16 traces, accumulates them, and writes a SEG-Y file on shutdown.
-    """
-
+class GPRsegySaver(Node):
     def __init__(self):
         super().__init__('gpr_segy_saver')
 
-        # 1) Parameters (must match your publisher exactly)
-        self.quantity = 1024
-        svc = self.quantity // 16
-        self.n_samples = self.quantity - svc      # e.g. 1024 - 64 = 960
-        self.window_cols = 1000                   # same as publisher → sliding window width
+        # ---------------------------------
+        # 1) Configuration parameters
+        # ---------------------------------
+        # Location to save .sgy files (relative to ROS2 workspace):
+        self.declare_parameter('output_subfolder', 'gpr_data')
+        output_subfolder = self.get_parameter('output_subfolder').get_parameter_value().string_value
 
-        # 2) CvBridge for image ↔ numpy conversion
+        # Build full path: <ros2_ws>/install/<package_name>/… → better to put in home folder:
+        home = os.path.expanduser('~')
+        self.save_folder = os.path.join(home, 'ros2_ws', 'data', output_subfolder)
+        os.makedirs(self.save_folder, exist_ok=True)
+
+        # Window size (in images) per incoming callback: not needed for SEGY writer,
+        # but used if you want to log “collected X traces so far” messages.
+        self.trace_counter = 0
+
+        # ---------------------------------
+        # 2) Set up internal storage
+        # ---------------------------------
+        # We will accumulate incoming GPR B-scan “traces” here:
+        # Each “trace” is expected to be a custom object with:
+        #   • .data           → 1-D NumPy array of int16 samples (length = n_samples)
+        #   • .header.x_source_coordinate, .header.y_source_coordinate → floats/ints
+        #
+        # In practice, we will wrap each incoming ROS Image into such a minimal trace object.
+        self.accumulated_traces = []                   # full list of all traces
+        self.batch_lock = threading.Lock()             # protect self.accumulated_traces
+
+        # A helper queue so that if ROS callbacks come faster than we can process, we buffer them:
+        self._image_queue = queue.Queue(maxsize=10)
+
+        # For converting ROS Image → OpenCV → NumPy:
         self.bridge = CvBridge()
 
-        # 3) Subscribe to /gpr/bscan
+        # ---------------------------------
+        # 3) Subscriber to /gpr/bscan topic
+        # ---------------------------------
+        # We assume /gpr/bscan publishes sensor_msgs/Image in mono8 (0–255) where
+        # each pixel row is one sample. We will convert each Image → int16 trace and store.
         self.subscription = self.create_subscription(
             Image,
             '/gpr/bscan',
             self.image_callback,
-            10
-        )
-        self.subscription  # prevent unused‐variable warning
+            10)
+        self.subscription  # prevent warning
 
-        # 4) Storage for accumulated traces
-        self.accumulated_traces = []  # list of 1D np.int16 arrays, each length = n_samples
-        self.lock = threading.Lock()
+        # ---------------------------------
+        # 4) Handle shutdown (Ctrl+C)
+        # ---------------------------------
+        # rclpy will call destroy_node() on shutdown; we intercept that to write SEG-Y.
+        self.add_on_shutdown(self.on_shutdown)   # this will be called when the node is shutting down
 
-        # 5) Track how many columns we've already taken from the rolling window
-        self.columns_taken = 0
+        self.get_logger().info('gpr_segy_saver node started, subscribing to /gpr/bscan…')
 
-        self.get_logger().info(
-            f"Subscribed to /gpr/bscan → expecting {self.n_samples} samples/trace, "
-            f"{self.window_cols} columns/window."
-        )
-
-        # 6) Register on_shutdown callback so we write SEG-Y when node shuts down
-        self.add_on_shutdown(self.on_shutdown)
-
+    # ─────────────────────────────────────────────────────────────────────────
+    # image_callback
+    # ─────────────────────────────────────────────────────────────────────────
     def image_callback(self, msg: Image):
         """
-        Called each time a new /gpr/bscan Image arrives.
-        Convert to NumPy, recover int16, extract only new columns, and append them.
+        Called whenever a new sensor_msgs/Image arrives on /gpr/bscan.
+        We convert it to a NumPy array (dtype=uint8), then to int16 trace samples,
+        wrap it into a simple object, and store in self.accumulated_traces.
         """
-        # 1) Convert ROS Image → cv2 (uint8) numpy array
+
+        # 1) Convert ROS Image → OpenCV gray image (mono8)
         try:
-            uchar_img = self.bridge.imgmsg_to_cv2(msg, desired_encoding='mono8')
+            cv_img = self.bridge.imgmsg_to_cv2(msg, desired_encoding='mono8')
         except Exception as e:
-            self.get_logger().error(f"CVBridge error: {e}")
+            self.get_logger().error(f"Failed to convert Image msg to CV2: {e}")
             return
 
-        h, w = uchar_img.shape
-        if h != self.n_samples or w != self.window_cols:
-            self.get_logger().warn(
-                f"Unexpected image size: got ({h}×{w}), expected ({self.n_samples}×{self.window_cols})"
-            )
-            # We can still attempt to process, but shape mismatch may lead to errors.
+        # 2) Convert mono8 (0–255) → int32 → int16 in range [-32768..+32767]
+        #    Reverse the original transformation: val_int32 = uint8 * (65535/255) → int16 = round(val_int32 - 32768)
+        uint8_img = np.asarray(cv_img, dtype=np.uint8)      # shape = (height, width), dtype=uint8
+        # We assume “height” = number of samples, “width” = number of columns on screen (window). We only need 1 column:
+        # Typically, the GPR B-scan stream sends one column of samples per Image. If the Image has multiple columns, pick one (e.g., the center).
+        # Here we take the middle column:
+        height, width = uint8_img.shape
+        col_idx = width // 2
+        mono_column = uint8_img[:, col_idx]  # shape = (height,)
+
+        # Re‐scale to int16:
+        #   1) upcast: int32 = uint8 * (65535.0/255.0)
+        #   2) subtract 32768, round, cast to int16
+        val_int32 = (mono_column.astype(np.int32) * (65535.0 / 255.0))
+        int16_trace = np.round(val_int32 - 32768.0).astype(np.int16)  # shape = (height,), dtype=int16
+
+        # 3) Build a minimal “trace object” with .data and .header.x_source_coordinate / .header.y_source_coordinate
+        class SimpleHeader:
+            def __init__(self, x, y):
+                self.x_source_coordinate = x
+                self.y_source_coordinate = y
+
+        class Trace:
+            def __init__(self, data, header):
+                self.data = data
+                self.header = header
+
+        # Use a placeholder X,Y based on trace_counter (we will clamp in on_shutdown).
+        # In a real system, you might get actual GPS coordinates from another sensor node.
+        x_coord = self.trace_counter
+        y_coord = 0
+
+        hdr = SimpleHeader(x_coord, y_coord)
+        trace = Trace(int16_trace, hdr)
+
+        # 4) Store the trace (thread‐safe)
+        with self.batch_lock:
+            self.accumulated_traces.append(trace)
+            self.trace_counter += 1
+
+        # Optionally log every 1000 traces:
+        if self.trace_counter % 1000 == 0:
+            self.get_logger().info(f"[gpr_segy_saver]: Collected {self.trace_counter} traces so far…")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # on_shutdown
+    # ─────────────────────────────────────────────────────────────────────────
+    def on_shutdown(self):
+        """
+        Called when rclpy is shutting down (e.g. user pressed Ctrl+C). 
+        This method writes ALL accumulated traces into a single GeoLitix-compatible
+        SEG-Y file in `self.save_folder`.
+        """
+
+        # 1) Copy & clear the accumulated traces under lock
+        with self.batch_lock:
+            traces = self.accumulated_traces[:]
+            self.accumulated_traces = []
+
+        n_traces = len(traces)
+        if n_traces == 0:
+            self.get_logger().warn("No GPR traces were collected. Skipping SEG-Y write.")
             return
 
-        # 2) Recover int16 from uint8 using inverse of publisher’s scaling:
-        #    int16 ≈ round( (uint8 * (65535/255)) - 32768 )
-        img_int32 = uchar_img.astype(np.int32)
-        recovered = (img_int32 * (65535.0 / 255.0)) - 32768.0
-        recovered = np.round(recovered).astype(np.int16)  # shape (n_samples, window_cols)
+        # Determine number of samples from first trace
+        n_samples = traces[0].data.shape[0]
 
-        # 3) Determine how many columns are truly “new” (not previously saved)
-        #    On the first callback, columns_taken = 0 → take all w columns.
-        #    After that, each new image overlaps with previous by (w - 1) columns,
-        #    so typically new_cols = 1. If frames get dropped, new_cols may be >1.
-        if self.columns_taken == 0:
-            new_cols = w
-        else:
-            # of the w columns in this image, the first (w - 1) were in the last image.
-            # So only the last column is guaranteed brand-new. However, if the node
-            # missed some images, you might have 2 or more brand-new columns. We can
-            # compute:
-            new_cols = w - (self.columns_taken % w)
+        # Stack data into a (n_samples × n_traces) NumPy array, dtype=int16
+        data_mat = np.zeros((n_samples, n_traces), dtype=np.int16)
+        for idx, tr in enumerate(traces):
+            arr = tr.data
+            if arr.dtype != np.int16:
+                arr = arr.astype(np.int16)
+            data_mat[:, idx] = arr
 
-        if new_cols <= 0:
-            # No new columns to take (rare unless frame‐dropping logic is odd). Skip.
+        # 2) Build the segyio spec
+        spec = segyio.spec()
+        spec.format  = 3                    # 3 = two-byte signed integer
+        spec.samples = np.arange(n_samples) # [0, 1, 2, …, n_samples-1]
+
+        # ■ CRUCIAL: set both ilines & xlines to zero to avoid any 16-bit overflow
+        spec.ilines = np.zeros(n_traces, dtype=np.int32)
+        spec.xlines = np.zeros(n_traces, dtype=np.int32)
+
+        # 3) Generate a timestamped filename in self.save_folder
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_filename = os.path.join(self.save_folder, f"gpr_output_{ts}.sgy")
+
+        # 4) Create & write the SEG-Y file
+        try:
+            with segyio.create(out_filename, spec) as segyfile:
+                # 4a) 3200-byte EBCDIC textual header (CP500)
+                txt  = "C 1 SEG-Y REV1.0\n"
+                txt += "C 2 GPR B-Scan GeoLitix-Compatible Export\n"
+                txt += f"C 3 Samples/Trace: {n_samples}\n"
+                txt += f"C 4 Total Traces: {n_traces}\n"
+                txt += "C 5 Sample Interval (µs): 1\n"  # must be ≥1 µs
+                txt  = txt.ljust(3200)[:3200]
+                ebc  = txt.encode("cp500", "replace")
+                segyfile.text[0] = ebc
+
+                # 4b) 400-byte binary header
+                segyfile.bin[segyio.BinField.JobID]      = 1
+                segyfile.bin[segyio.BinField.LineNumber] = 1
+                segyfile.bin[segyio.BinField.ReelNumber] = 1
+                segyfile.bin[segyio.BinField.Samples]    = n_samples
+                segyfile.bin[segyio.BinField.Interval]   = 1    # 1 µs (nonzero)
+                segyfile.bin[segyio.BinField.Format]     = 3    # 2-byte signed int
+
+                # 4c) Write each trace’s header + data
+                for tr_idx in range(n_traces):
+                    tr = traces[tr_idx]
+                    hdr = segyfile.header[tr_idx]
+
+                    # Required trace‐header fields
+                    hdr[segyio.TraceField.TraceSequenceNumber] = tr_idx + 1
+                    hdr[segyio.TraceField.FieldRecordNumber]   = 1
+                    hdr[segyio.TraceField.TraceNumber]         = tr_idx + 1
+
+                    # Build CDP_X / CDP_Y (clamped to ±32767)
+                    x_src = getattr(tr.header, "x_source_coordinate", None)
+                    y_src = getattr(tr.header, "y_source_coordinate", None)
+                    if x_src is not None and y_src is not None:
+                        x_val = int(round(x_src))
+                        y_val = int(round(y_src))
+                    else:
+                        x_val = tr_idx    # fallback “trace index”
+                        y_val = 0
+
+                    # Clamp x_val and y_val to signed 16-bit range
+                    if x_val >  32767:
+                        x_val = x_val // (int(np.ceil(x_val / 32767)) or 1)
+                    if x_val < -32768:
+                        x_val = x_val // (int(np.ceil(abs(x_val) / 32768)) or 1)
+                    if y_val >  32767:
+                        y_val = y_val // (int(np.ceil(y_val / 32767)) or 1)
+                    if y_val < -32768:
+                        y_val = y_val // (int(np.ceil(abs(y_val) / 32768)) or 1)
+
+                    hdr[segyio.TraceField.CDP_X] = x_val
+                    hdr[segyio.TraceField.CDP_Y] = y_val
+
+                    # Finally write the samples (big-endian int16)
+                    segyfile.trace[tr_idx] = data_mat[:, tr_idx].astype(">i2")
+
+            self.get_logger().info(f"SEG-Y file written (GeoLitix OK): {out_filename}")
+
+        except Exception as e:
+            self.get_logger().error(f"Failed to create/write SEG-Y: {e}")
             return
-
-        # 4) Slice out the new columns from the right side:
-        #    recovered[:, (w - new_cols) : w]
-        new_data = recovered[:, (w - new_cols):w]  # shape = (n_samples, new_cols)
-
-        # 5) Append each new column (trace) to accumulated_traces (thread‐safe)
-        with self.lock:
-            for col_idx in range(new_data.shape[1]):
-                trace_col = new_data[:, col_idx].copy()  # copy to avoid buffer reuse
-                self.accumulated_traces.append(trace_col)
-
-        self.columns_taken += new_cols
-
-        # (Optional) Log every 100 traces:
-        if self.columns_taken % 100 == 0:
-            self.get_logger().info(f"Collected {self.columns_taken} traces so far...")
-
-def on_shutdown(self):
-    """
-    Write the accumulated GPR traces into a GeoLitix-compatible SEG-Y file.
-    Uses CDP_X/CDP_Y for horizontal location and clamps them to 16-bit.
-    """
-
-    self.get_logger().info("Shutdown initiated → writing GeoLitix‐compatible SEG-Y file…")
-
-    # 1) Stack all collected traces into a 2D array (n_samples × n_traces)
-    with self.gpr_logger_last_700_traces_lock:
-        batch = self.gpr_logger_last_700_traces
-        self.gpr_logger_last_700_traces = None
-
-    if batch is None or len(batch.traces) == 0:
-        self.get_logger().warn("No traces to write. Exiting.")
-        return
-
-    n_traces = len(batch.traces)
-    n_samples = batch.traces[0].data.shape[0]
-
-    data_mat = np.zeros((n_samples, n_traces), dtype=np.int16)
-    for i, tr in enumerate(batch.traces):
-        # Make sure it’s int16, otherwise cast
-        if tr.data.dtype != np.int16:
-            data_mat[:, i] = tr.data.astype(np.int16)
-        else:
-            data_mat[:, i] = tr.data
-
-    # 2) Build a minimal SEG-Y spec
-    spec = segyio.spec()
-    spec.format  = 3                  # 2-byte signed integer
-    spec.samples = np.arange(n_samples)
-
-    # Set both inline & crossline to zero (no overflow risk)
-    spec.ilines = np.zeros(n_traces, dtype=np.int32)
-    spec.xlines = np.zeros(n_traces, dtype=np.int32)
-
-    # 3) Prepare output filename (project folder + timestamp)
-    project_folder = self.task_manager.get_current_project_path()
-    gpr_folder = os.path.join(project_folder, self.task_manager.gpr_path)
-    os.makedirs(gpr_folder, exist_ok=True)
-
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_filename = os.path.join(gpr_folder, f"gpr_output_{ts}.sgy")
-
-    # 4) Create and write the SEG-Y file
-    with segyio.create(out_filename, spec) as segyfile:
-        #
-        # 4a) 3200-byte EBCDIC textual header (CP500)
-        #
-        txt  = "C 1 SEG-Y REV1.0\n"
-        txt += "C 2 GPR B-Scan GeoLitix-Compatible Export\n"
-        txt += f"C 3 Samples/Trace: {n_samples}\n"
-        txt += f"C 4 Total Traces: {n_traces}\n"
-        txt += "C 5 Sample Interval (µs): 1\n"  # must be ≥1 µs
-        txt  = txt.ljust(3200)[:3200]
-
-        ebc = txt.encode("cp500", "replace")
-        segyfile.text[0] = ebc
-
-        #
-        # 4b) 400-byte binary header
-        #
-        segyfile.bin[segyio.BinField.JobID]       = 1
-        segyfile.bin[segyio.BinField.LineNumber]  = 1
-        segyfile.bin[segyio.BinField.ReelNumber]  = 1
-        segyfile.bin[segyio.BinField.Samples]     = n_samples
-        segyfile.bin[segyio.BinField.Interval]    = 1
-        segyfile.bin[segyio.BinField.Format]      = 3
-
-        #
-        # 4c) Write each trace’s header + data
-        #
-        for tr_idx in range(n_traces):
-            tr = batch.traces[tr_idx]
-            hdr = segyfile.header[tr_idx]
-
-            # Required trace‐header fields
-            hdr[segyio.TraceField.TraceSequenceNumber] = tr_idx + 1
-            hdr[segyio.TraceField.FieldRecordNumber]   = 1
-            hdr[segyio.TraceField.TraceNumber]         = tr_idx + 1
-
-            # Build CDP_X / CDP_Y for geometry
-            # Option A: if your .header has x_source_coordinate / y_source_coordinate:
-            x_src = getattr(tr.header, "x_source_coordinate", None)
-            y_src = getattr(tr.header, "y_source_coordinate", None)
-
-            if x_src is not None and y_src is not None:
-                # Round to integer and clamp into 16-bit range
-                x_val = int(round(x_src))
-                y_val = int(round(y_src))
-            else:
-                # Option B: fallback to equally spaced line along X, Y = 0.
-                x_val = tr_idx  # This alone WILL overflow if tr_idx > 32767
-                y_val = 0
-
-            # Clamp x_val / y_val to signed 16-bit max/min
-            if x_val >  32767: x_val = x_val // (int(np.ceil(x_val / 32767)) or 1)
-            if x_val < -32768: x_val = x_val // (int(np.ceil(abs(x_val) / 32768)) or 1)
-            if y_val >  32767: y_val = y_val // (int(np.ceil(y_val / 32767)) or 1)
-            if y_val < -32768: y_val = y_val // (int(np.ceil(abs(y_val) / 32768)) or 1)
-
-            hdr[segyio.TraceField.CDP_X] = x_val
-            hdr[segyio.TraceField.CDP_Y] = y_val
-
-            # Write the trace samples in big-endian int16
-            segyfile.trace[tr_idx] = data_mat[:, tr_idx].astype(">i2")
-
-    self.get_logger().info(f"SEG-Y file written (GeoLitix OK): {out_filename}")
-
-        # Node can now exit
-        return
 
 
 def main(args=None):
     rclpy.init(args=args)
-    node = GPRSegySaver()
+    node = GPRsegySaver()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
+        # CTRL+C: rclpy will call on_shutdown() automatically
         pass
     finally:
-        # If ctrl-C or rclpy.shutdown was called, on_shutdown() has already run
         node.destroy_node()
         rclpy.shutdown()
 
