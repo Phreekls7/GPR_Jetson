@@ -1,9 +1,16 @@
 import sys
+import threading
 import rclpy
 from rclpy.node import Node
-from nav_msgs.msg import Odometry
+from rclpy.executors import SingleThreadedExecutor
+
+# Messages
+from px4_msgs.msg import VehicleOdometry  # REP147-compatible vehicle odometry
 from sensor_msgs.msg import Image, Range
 from cv_bridge import CvBridge
+
+# QoS for PX4 topics
+from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSDurabilityPolicy
 
 from PyQt5.QtWidgets import QApplication, QMainWindow, QWidget, QVBoxLayout, QLabel, QHBoxLayout
 from PyQt5.QtCore import QTimer, Qt
@@ -14,85 +21,111 @@ class TelemetryGUI(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle('Drone Telemetry')
-        # ROS2 init
+
+        # --- ROS2 init, node, and executor in background thread ---
         rclpy.init(args=None)
-        self.node = rclpy.create_node('telemetry_gui')
-        # Subscribers
-        self.node.create_subscription(Image, '/gpr/bscan', self.gpr_cb, 10)
-        self.node.create_subscription(Odometry, '/odom', self.odom_cb, 10)
-        self.node.create_subscription(Range, '/range', self.range_cb, 10)
+        self.node = Node('telemetry_gui')
+        self.executor = SingleThreadedExecutor()
+        self.executor.add_node(self.node)
+        self.spin_thread = threading.Thread(target=self.executor.spin, daemon=True)
+        self.spin_thread.start()
+
+        # --- Subscribers (with matching QoS) ---
         self.bridge = CvBridge()
+        # GPR B-scan (default QoS)
+        self.node.create_subscription(Image, '/gpr/bscan', self.gpr_cb, 10)
+        # Laser range
+        self.node.create_subscription(Range, '/range', self.range_cb, 10)
+        # Vehicle odometry (best-effort, volatile)
+        odom_qos = QoSProfile(depth=10)
+        odom_qos.reliability = QoSReliabilityPolicy.BEST_EFFORT
+        odom_qos.durability = QoSDurabilityPolicy.VOLATILE
+        self.node.create_subscription(VehicleOdometry, '/vehicle_odometry', self.odom_cb, qos_profile=odom_qos)
 
-        # Data containers
-        self.path = []  # list of (x,y)
-        self.latest_gpr = None
-        self.latest_range = None
+        # --- Data containers ---
+        self.path = []           # list of (x, y)
+        self.origin = None       # origin offset for centering path
+        self.latest_gpr = None   # numpy array
+        self.latest_range = None # float
 
-        # Build UI
+        # --- Build UI ---
         central = QWidget()
         self.setCentralWidget(central)
         layout = QVBoxLayout(central)
 
-        # Top: flight path + range
+        # Top layout: flight path + range display
         top = QHBoxLayout()
-        # Flight path plot
         self.plot_widget = pg.PlotWidget(title="Flight Path")
         self.plot_widget.setAspectLocked(True)
+        # Keep full view, auto-range enabled
+        self.plot_widget.enableAutoRange()
         self.path_curve = self.plot_widget.plot([], [], pen=pg.mkPen(width=2))
         top.addWidget(self.plot_widget, stretch=3)
-        # Range display
-        self.range_label = QLabel("Range: --")
+
+        self.range_label = QLabel("Range: -- m")
         self.range_label.setAlignment(Qt.AlignCenter)
         self.range_label.setFixedWidth(150)
         top.addWidget(self.range_label, stretch=1)
 
         layout.addLayout(top, stretch=1)
 
-        # Bottom: GPR B-scan image
+        # Bottom layout: GPR B-scan image
         self.img_view = pg.ImageView(view=pg.PlotItem())
-        self.img_view.ui.histogram.hide()
-        self.img_view.ui.roiBtn.hide()
-        self.img_view.ui.menuBtn.hide()
-        layout.addWidget(self.img_view, stretch=1)
+        for btn in (self.img_view.ui.histogram, self.img_view.ui.roiBtn, self.img_view.ui.menuBtn):
+            btn.hide()
+        layout.addWidget(self.img_view, stretch=2)
 
-        # Timer for ROS spin and UI update
-        self.timer = QTimer()
-        self.timer.timeout.connect(self.update)
-        self.timer.start(30)  # 30 ms ~ 33 Hz
+        # --- Timer for UI updates only ---
+        self.ui_timer = QTimer()
+        self.ui_timer.timeout.connect(self.update_ui)
+        self.ui_timer.start(30)  # ms (~33 Hz)
 
     def gpr_cb(self, msg: Image):
-        # Convert ROS image to numpy
-        img = self.bridge.imgmsg_to_cv2(msg, desired_encoding='mono8')
-        self.latest_gpr = img
+        self.latest_gpr = self.bridge.imgmsg_to_cv2(msg, desired_encoding='mono8')
 
-    def odom_cb(self, msg: Odometry):
-        x = msg.pose.pose.position.x
-        y = msg.pose.pose.position.y
-        self.path.append((x, y))
-        # Keep last N points
-        if len(self.path) > 1000:
-            self.path = self.path[-1000:]
+    def odom_cb(self, msg: VehicleOdometry):
+        # Raw NED to ENU conversion is optional; for closing loops you might use raw
+        # Uncomment if you need Earth-frame ENU:
+        # x_ned, y_ned, _ = msg.position
+        # x, y = y_ned, x_ned
+        # For raw loop closure, use direct NED XY:
+        x, y, _ = msg.position
+
+        # Initialize origin so that first point maps to (0,0)
+        if self.origin is None:
+            self.origin = (x, y)
+        x_rel = x - self.origin[0]
+        y_rel = y - self.origin[1]
+
+        self.path.append((x_rel, y_rel))
+        # Leave full history so loops will close visibly
+        # (No max-length cropping)
+
+        self.node.get_logger().debug(f"[GUI] odom_cb → x_rel={x_rel:.2f}, y_rel={y_rel:.2f}")
 
     def range_cb(self, msg: Range):
         self.latest_range = msg.range
 
-    def update(self):
-        # Spin ROS once
-        rclpy.spin_once(self.node, timeout_sec=0)
+    def update_ui(self):
         # Update flight path
         if self.path:
             xs, ys = zip(*self.path)
             self.path_curve.setData(xs, ys)
-        # Update range label
+            # Auto-range view so all points remain visible
+            self.plot_widget.enableAutoRange()
+
+        # Update range display
         if self.latest_range is not None:
             self.range_label.setText(f"Range: {self.latest_range:.2f} m")
+
         # Update GPR image
         if self.latest_gpr is not None:
-            # Show as transposed to orient correctly if needed
             self.img_view.setImage(self.latest_gpr.T, autoLevels=True)
 
     def closeEvent(self, event):
-        # Clean up ROS
+        # Clean up: stop executor and thread
+        self.executor.shutdown()
+        self.spin_thread.join(timeout=1.0)
         self.node.destroy_node()
         rclpy.shutdown()
         event.accept()
