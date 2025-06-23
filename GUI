@@ -63,14 +63,15 @@ class TelemetryGUI(QMainWindow):
         self.range_label.setAlignment(Qt.AlignCenter)
         self.range_label.setFixedWidth(150)
         top.addWidget(self.range_label, stretch=1)
-        layout.addLayout(top, stretch=1)
+        layout.addLayout(top, stretch=1)  # top half (flight path + range)
+
 
         # Bottom: GPR B-scan image
         self.img_view = pg.ImageView(view=pg.PlotItem())
         self.img_view.ui.histogram.hide()
         self.img_view.ui.roiBtn.hide()
         self.img_view.ui.menuBtn.hide()
-        layout.addWidget(self.img_view, stretch=1)
+        layout.addWidget(self.img_view, stretch=1)  # bottom half (GPR image))
 
         # --- Timer for UI updates ---
         self.ui_timer = QTimer()
