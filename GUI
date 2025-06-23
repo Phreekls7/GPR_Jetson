@@ -78,51 +78,30 @@ class TelemetryGUI(QMainWindow):
         self.ui_timer.timeout.connect(self.update_ui)
         self.ui_timer.start(30)  # ms (~33 Hz)
 
-    def gpr_cb(self, msg: Image):
-        """Handle incoming GPR B-scan Image."""
-        self.latest_gpr = self.bridge.imgmsg_to_cv2(msg, desired_encoding='mono8')
-
-    def odom_cb(self, msg: VehicleOdometry):
-        """
-        Handle VehicleOdometry.
-        Use FRD if available, else convert NED→ENU. Rotate using yaw so heading aligns loops.
-        """
-        # Select frame
-        if msg.pose_frame == VehicleOdometry.POSE_FRAME_FRD:
-            x, y, _ = msg.position
-        else:
-            x_ned, y_ned, _ = msg.position
-            x = y_ned
-            y = x_ned
-
-        # Initialize origin on first callback
-        if self.origin is None:
-            self.origin = (x, y)
-        # Compute relative position
-        x_rel = x - self.origin[0]
-        y_rel = y - self.origin[1]
-
-        # Compute yaw from quaternion (w,x,y,z)
-        w, xq, yq, zq = msg.q
-        yaw = math.atan2(2*(w*zq + xq*yq), 1 - 2*(yq*yq + zq*zq))
-
-        # Rotate relative XY by -yaw to align heading
-        cos_y = math.cos(-yaw)
-        sin_y = math.sin(-yaw)
-        x_rot = x_rel * cos_y - y_rel * sin_y
-        y_rot = x_rel * sin_y + y_rel * cos_y
-
-        # Append rotated point
-        self.path.append((x_rot, y_rot))
-        self.node.get_logger().debug(
-            f"[GUI] odom_cb → x_rel={x_rel:.2f}, y_rel={y_rel:.2f}, yaw={math.degrees(yaw):.1f}°"
-        )
-
-    def range_cb(self, msg: Range):
-        """Handle incoming Range."""
-        self.latest_range = msg.range
+        # --- Freeze image view to always show full data ---
+        iv_view = self.img_view.getView()
+        iv_view.enableAutoRange(False)
+        iv_view.setAspectLocked(False)
 
     def update_ui(self):
+        """Update UI: path plot, range label, and full-width GPR image."""
+        # Flight path
+        if self.path:
+            xs, ys = zip(*self.path)
+            self.path_curve.setData(xs, ys)
+        # Range display
+        if self.latest_range is not None:
+            self.range_label.setText(f"Range: {self.latest_range:.2f} m")
+        # GPR image: always show full window_cols history
+        if self.latest_gpr is not None:
+            img = self.latest_gpr.T
+            self.img_view.setImage(img, autoLevels=True)
+            # Lock view to full image extent (no panning/zooming)
+            h, w = img.shape
+            v = self.img_view.getView()
+            v.setRange(xRange=[0, w], yRange=[0, h], padding=0)
+
+    def closeEvent(self, event):(self):
         """Update all UI elements: path, range label, GPR image."""
         # Flight path
         if self.path:
