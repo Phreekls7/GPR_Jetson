@@ -129,13 +129,13 @@ class TelemetryGUI(QMainWindow):
     def range_cb(self, msg: Range):
         self.latest_range = msg.range
 
-    def update_map_background(self):
-        # Compute bbox in local meters
+        def update_map_background(self):
+        # Compute bounding box in local ENU meters
         xs, ys = zip(*self.path)
         buf = 10.0
         min_x, max_x = min(xs) - buf, max(xs) + buf
         min_y, max_y = min(ys) - buf, max(ys) + buf
-        # ENU->latlon
+        # Convert ENU -> lat/lon
         ll_lon, ll_lat = self.proj.transform(min_x, min_y)
         ur_lon, ur_lat = self.proj.transform(max_x, max_y)
         # Fetch static map (Google Static Maps example)
@@ -144,13 +144,23 @@ class TelemetryGUI(QMainWindow):
             f'?size=800x800&maptype=satellite&visible={ll_lat},{ll_lon}|{ur_lat},{ur_lon}'
             '&key=YOUR_API_KEY'
         )
-        resp = requests.get(url)
+        try:
+            resp = requests.get(url, timeout=10)
+        except Exception as e:
+            self.node.get_logger().error(f"Map fetch exception: {e}")
+            return
+        if resp.status_code != 200:
+            self.node.get_logger().error(f"Map fetch failed: HTTP {resp.status_code}")
+            return
         # Decode image via OpenCV
         buf = np.frombuffer(resp.content, dtype=np.uint8)
         cv_img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
-        # Convert BGR (OpenCV default) to RGB
+        if cv_img is None:
+            self.node.get_logger().error("Failed to decode map image")
+            return
+        # Convert BGR to RGB
         arr = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
-        # Display
+        # Display underlay
         h, w, _ = arr.shape
         self.map_item.setImage(arr)
         self.map_item.setRect(min_x, min_y, max_x - min_x, max_y - min_y)
