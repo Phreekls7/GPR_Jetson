@@ -135,25 +135,41 @@ class TelemetryGUI(QMainWindow):
         min_y, max_y = min(ys) - buf, max(ys) + buf
         ll_lon, ll_lat = self.proj.transform(min_x, min_y)
         ur_lon, ur_lat = self.proj.transform(max_x, max_y)
-        url = (
+                # Try Google Static Maps (requires API key)
+        url_google = (
             'https://maps.googleapis.com/maps/api/staticmap'
             f'?size=800x800&maptype=satellite&visible={ll_lat},{ll_lon}|{ur_lat},{ur_lon}'
             '&key=YOUR_API_KEY'
         )
-        try:
-            resp = requests.get(url, timeout=10)
-        except Exception as e:
-            self.node.get_logger().error(f"Map fetch exception: {e}")
+        # Fallback: OpenStreetMap Static Map
+        # Calculate center and approximate zoom
+        center_lat = (ll_lat + ur_lat) / 2
+        center_lon = (ll_lon + ur_lon) / 2
+        zoom = 16  # adjust as needed
+        url_osm = (
+            'https://staticmap.openstreetmap.de/staticmap.php'
+            f'?center={center_lat},{center_lon}'
+            f'&zoom={zoom}&size=800x800'
+        )
+        # Fetch map: try Google first, then OSM
+        for url in (url_google, url_osm):
+            try:
+                resp = requests.get(url, timeout=10)
+                if resp.status_code == 200:
+                    break
+            except Exception:
+                continue
+        else:
+            self.node.get_logger().error(f"Map fetch failed on both services: HTTP {[resp.status_code if 'resp' in locals() else 'n/a']}")
             return
-        if resp.status_code != 200:
-            self.node.get_logger().error(f"Map fetch failed: HTTP {resp.status_code}")
-            return
+        # Decode image via OpenCV
         buf = np.frombuffer(resp.content, dtype=np.uint8)
         cv_img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
         if cv_img is None:
             self.node.get_logger().error("Failed to decode map image")
             return
         arr = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
+        # Display underlay
         self.map_item.setImage(arr)
         self.map_item.setRect(min_x, min_y, max_x - min_x, max_y - min_y)
         self.map_ready = True
