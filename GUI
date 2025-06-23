@@ -70,7 +70,7 @@ class TelemetryGUI(QMainWindow):
         self.img_view.ui.histogram.hide()
         self.img_view.ui.roiBtn.hide()
         self.img_view.ui.menuBtn.hide()
-        layout.addWidget(self.img_view, stretch=2)
+        layout.addWidget(self.img_view, stretch=1)
 
         # --- Timer for UI updates ---
         self.ui_timer = QTimer()
