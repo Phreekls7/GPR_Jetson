@@ -32,11 +32,8 @@ class TelemetryGUI(QMainWindow):
 
         # --- Subscribers (with matching QoS) ---
         self.bridge = CvBridge()
-        # GPR B-scan (default QoS)
-        self.node.create_subscription(Image, '/gpr/bscan', self.gpr_cb, 10)
-        # Laser range
-        self.node.create_subscription(Range, '/range', self.range_cb, 10)
-        # Vehicle odometry (best-effort, volatile)
+        self.node.create_subscription(Image, '/gpr/bscan', self.gpr_cb, qos_profile=10)
+        self.node.create_subscription(Range, '/range', self.range_cb, qos_profile=10)
         odom_qos = QoSProfile(depth=10)
         odom_qos.reliability = QoSReliabilityPolicy.BEST_EFFORT
         odom_qos.durability = QoSDurabilityPolicy.VOLATILE
@@ -44,9 +41,9 @@ class TelemetryGUI(QMainWindow):
 
         # --- Data containers ---
         self.path = []           # list of (x, y)
-        self.origin = None       # origin offset for centering path
-        self.latest_gpr = None   # numpy array
-        self.latest_range = None # float
+        self.origin = None       # for centering path
+        self.latest_gpr = None   # numpy array for GPR image
+        self.latest_range = None # float for range
 
         # --- Build UI ---
         central = QWidget()
@@ -56,8 +53,9 @@ class TelemetryGUI(QMainWindow):
         # Top layout: flight path + range display
         top = QHBoxLayout()
         self.plot_widget = pg.PlotWidget(title="Flight Path")
+        # Lock aspect to square
         self.plot_widget.setAspectLocked(True)
-        # Keep full view, auto-range enabled
+        # Auto-range once to include full flight path
         self.plot_widget.enableAutoRange()
         self.path_curve = self.plot_widget.plot([], [], pen=pg.mkPen(width=2))
         top.addWidget(self.plot_widget, stretch=3)
@@ -66,16 +64,15 @@ class TelemetryGUI(QMainWindow):
         self.range_label.setAlignment(Qt.AlignCenter)
         self.range_label.setFixedWidth(150)
         top.addWidget(self.range_label, stretch=1)
-
         layout.addLayout(top, stretch=1)
 
-        # Bottom layout: GPR B-scan image
+        # Bottom: GPR B-scan image
         self.img_view = pg.ImageView(view=pg.PlotItem())
         for btn in (self.img_view.ui.histogram, self.img_view.ui.roiBtn, self.img_view.ui.menuBtn):
             btn.hide()
         layout.addWidget(self.img_view, stretch=2)
 
-        # --- Timer for UI updates only ---
+        # --- Timer for UI updates ---
         self.ui_timer = QTimer()
         self.ui_timer.timeout.connect(self.update_ui)
         self.ui_timer.start(30)  # ms (~33 Hz)
@@ -83,27 +80,35 @@ class TelemetryGUI(QMainWindow):
     def gpr_cb(self, msg: Image):
         self.latest_gpr = self.bridge.imgmsg_to_cv2(msg, desired_encoding='mono8')
 
-    def odom_cb(self, msg: VehicleOdometry):
-        # Raw NED to ENU conversion is optional; for closing loops you might use raw
-        # Uncomment if you need Earth-frame ENU:
-        # x_ned, y_ned, _ = msg.position
-        # x, y = y_ned, x_ned
-        # For raw loop closure, use direct NED XY:
-        x, y, _ = msg.position
+        def odom_cb(self, msg: VehicleOdometry):
+        """
+        Handle incoming VehicleOdometry. Use FRD world-fixed frame (arbitrary origin) if available,
+        otherwise fall back to NED->ENU conversion.
+        """
+        # Determine which frame the position is in
+        if msg.pose_frame == VehicleOdometry.POSE_FRAME_FRD:
+            # FRD world-fixed: use position directly (X forward, Y right)
+            x, y, _ = msg.position
+        else:
+            # NED earth-fixed: convert to ENU by swapping axes
+            x_ned, y_ned, _ = msg.position
+            x =  y_ned
+            y =  x_ned
 
         # Initialize origin so that first point maps to (0,0)
         if self.origin is None:
             self.origin = (x, y)
+        # Compute relative coordinates
         x_rel = x - self.origin[0]
         y_rel = y - self.origin[1]
 
+        # Append to path and debug log
         self.path.append((x_rel, y_rel))
-        # Leave full history so loops will close visibly
-        # (No max-length cropping)
+        self.node.get_logger().debug(
+            f"[GUI] odom_cb → frame={msg.pose_frame}, x_rel={x_rel:.2f}, y_rel={y_rel:.2f}"
+        )
 
-        self.node.get_logger().debug(f"[GUI] odom_cb → x_rel={x_rel:.2f}, y_rel={y_rel:.2f}")
-
-    def range_cb(self, msg: Range):
+    def range_cb(self, msg: Range):(self, msg: Range):
         self.latest_range = msg.range
 
     def update_ui(self):
@@ -111,19 +116,15 @@ class TelemetryGUI(QMainWindow):
         if self.path:
             xs, ys = zip(*self.path)
             self.path_curve.setData(xs, ys)
-            # Auto-range view so all points remain visible
-            self.plot_widget.enableAutoRange()
-
-        # Update range display
+        # Update range
         if self.latest_range is not None:
             self.range_label.setText(f"Range: {self.latest_range:.2f} m")
-
         # Update GPR image
         if self.latest_gpr is not None:
             self.img_view.setImage(self.latest_gpr.T, autoLevels=True)
 
     def closeEvent(self, event):
-        # Clean up: stop executor and thread
+        # Cleanup
         self.executor.shutdown()
         self.spin_thread.join(timeout=1.0)
         self.node.destroy_node()
