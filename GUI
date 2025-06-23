@@ -19,12 +19,16 @@ from PyQt5.QtCore import QTimer, Qt
 import pyqtgraph as pg
 import numpy as np
 
+# Map and projection
+import requests
+import pyproj
+
 class TelemetryGUI(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle('Drone Telemetry')
 
-        # ROS2 initialization
+        # ROS2 init
         rclpy.init(args=None)
         self.node = Node('telemetry_gui')
         self.executor = SingleThreadedExecutor()
@@ -32,13 +36,12 @@ class TelemetryGUI(QMainWindow):
         self.spin_thread = threading.Thread(target=self.executor.spin, daemon=True)
         self.spin_thread.start()
 
-        # Subscriptions
+        # Bridge for images
         self.bridge = CvBridge()
-        # GPR B-scan
+
+        # Subscriptions
         self.node.create_subscription(Image, '/gpr/bscan', self.gpr_cb, qos_profile=10)
-        # Laser range
         self.node.create_subscription(Range, '/range', self.range_cb, qos_profile=10)
-        # Vehicle odometry
         odom_qos = QoSProfile(depth=10)
         odom_qos.reliability = QoSReliabilityPolicy.BEST_EFFORT
         odom_qos.durability = QoSDurabilityPolicy.VOLATILE
@@ -53,16 +56,32 @@ class TelemetryGUI(QMainWindow):
         self.latest_gpr = None
         self.latest_range = None
 
-        # UI layout
+        # Map background setup
+        self.map_item = pg.ImageItem()
+        self.map_ready = False
+        # Geographic origin (set your takeoff coords here)
+        self.orig_lat = 37.123456
+        self.orig_lon = -122.123456
+        # Projection: local ENU (meters) -> lat/lon
+        # Replace zone number as appropriate for your location
+        utm_zone = int((self.orig_lon + 180) / 6) + 1
+        proj_str = f'+proj=utm +zone={utm_zone} +datum=WGS84'
+        self.proj = pyproj.Transformer.from_crs(proj_str, 'EPSG:4326', always_xy=True)
+
+        # Build UI
         central = QWidget()
         self.setCentralWidget(central)
         layout = QVBoxLayout(central)
 
-        # Top: flight path + range (half height)
+        # Top: flight path + range (upper half)
         top = QHBoxLayout()
         self.plot = pg.PlotWidget(title='Flight Path')
         self.plot.setAspectLocked(True)
-        self.path_curve = self.plot.plot([], [], pen=pg.mkPen(width=2))
+        self.plot.enableAutoRange()
+        # Add map underlay before curve
+        self.plot.addItem(self.map_item)
+        self.map_item.setZValue(-100)
+        self.path_curve = self.plot.plot([], [], pen=pg.mkPen(width=2, color='w'))
         top.addWidget(self.plot, stretch=3)
         self.range_label = QLabel('Range: -- m')
         self.range_label.setAlignment(Qt.AlignCenter)
@@ -70,28 +89,25 @@ class TelemetryGUI(QMainWindow):
         top.addWidget(self.range_label, stretch=1)
         layout.addLayout(top, stretch=1)
 
-        # Bottom: GPR image (half height)
+        # Bottom: GPR B-scan (lower half)
         self.img_view = pg.ImageView(view=pg.PlotItem())
-        self.img_view.ui.histogram.hide()
-        self.img_view.ui.roiBtn.hide()
-        self.img_view.ui.menuBtn.hide()
-        # Freeze view
+        for btn in (self.img_view.ui.histogram, self.img_view.ui.roiBtn, self.img_view.ui.menuBtn):
+            btn.hide()
         view = self.img_view.getView()
         view.enableAutoRange(False)
         view.setAspectLocked(False)
         layout.addWidget(self.img_view, stretch=1)
 
-        # Timer for UI updates
+        # Timer for updates
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_ui)
         self.timer.start(30)
 
     def gpr_cb(self, msg: Image):
-        # Convert to numpy
         self.latest_gpr = self.bridge.imgmsg_to_cv2(msg, 'mono8')
 
     def odom_cb(self, msg: VehicleOdometry):
-        # Choose frame
+        # Choose frame: FRD vs NED
         if msg.pose_frame == VehicleOdometry.POSE_FRAME_FRD:
             x, y, _ = msg.position
         else:
@@ -101,27 +117,56 @@ class TelemetryGUI(QMainWindow):
         if self.origin is None:
             self.origin = (x, y)
         xr, yr = x - self.origin[0], y - self.origin[1]
-        # Yaw rotation
+        # Yaw from quaternion
         w, xq, yq, zq = msg.q
         yaw = math.atan2(2*(w*zq + xq*yq), 1 - 2*(yq*yq + zq*zq))
         c, s = math.cos(-yaw), math.sin(-yaw)
         xr2 = xr*c - yr*s
         yr2 = xr*s + yr*c
         self.path.append((xr2, yr2))
-        self.node.get_logger().debug(f'Odom → rel=({xr:.2f},{yr:.2f}), yaw={math.degrees(yaw):.1f}')
 
     def range_cb(self, msg: Range):
         self.latest_range = msg.range
 
+    def update_map_background(self):
+        # Compute bbox in local meters
+        xs, ys = zip(*self.path)
+        buf = 10.0
+        min_x, max_x = min(xs) - buf, max(xs) + buf
+        min_y, max_y = min(ys) - buf, max(ys) + buf
+        # ENU->latlon
+        ll_lon, ll_lat = self.proj.transform(min_x, min_y)
+        ur_lon, ur_lat = self.proj.transform(max_x, max_y)
+        # Fetch static map (Google Static Maps example)
+        url = (
+            'https://maps.googleapis.com/maps/api/staticmap'
+            f'?size=800x800&maptype=satellite&visible={ll_lat},{ll_lon}|{ur_lat},{ur_lon}'
+            '&key=YOUR_API_KEY'
+        )
+        resp = requests.get(url)
+        img = pg.functions.loadImageFromData(resp.content)
+        ptr = img.bits()
+        ptr.setsize(img.byteCount())
+        arr = np.frombuffer(ptr, np.uint8).reshape((img.height(), img.width(), 4))
+        arr = arr[..., :3]
+        # Display
+        h, w, _ = arr.shape
+        self.map_item.setImage(arr)
+        self.map_item.setRect(min_x, min_y, max_x - min_x, max_y - min_y)
+        self.map_ready = True
+
     def update_ui(self):
-        # Plot path
+        # On first path population, load map
+        if not self.map_ready and len(self.path) > 1:
+            self.update_map_background()
+        # Draw path
         if self.path:
             xs, ys = zip(*self.path)
             self.path_curve.setData(xs, ys)
         # Update range
         if self.latest_range is not None:
             self.range_label.setText(f'Range: {self.latest_range:.2f} m')
-        # Show full GPR image
+        # Update GPR
         if self.latest_gpr is not None:
             img = self.latest_gpr.T
             self.img_view.setImage(img, autoLevels=True)
@@ -130,7 +175,6 @@ class TelemetryGUI(QMainWindow):
             v.setRange(xRange=(0, w), yRange=(0, h), padding=0)
 
     def closeEvent(self, event):
-        # Cleanup
         self.executor.shutdown()
         self.spin_thread.join(timeout=1.0)
         self.node.destroy_node()
