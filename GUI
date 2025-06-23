@@ -18,6 +18,7 @@ from PyQt5.QtWidgets import QApplication, QMainWindow, QWidget, QVBoxLayout, QLa
 from PyQt5.QtCore import QTimer, Qt
 import pyqtgraph as pg
 import numpy as np
+import cv2  # for decoding map images
 
 # Map and projection
 import requests
@@ -144,11 +145,11 @@ class TelemetryGUI(QMainWindow):
             '&key=YOUR_API_KEY'
         )
         resp = requests.get(url)
-        img = pg.functions.loadImageFromData(resp.content)
-        ptr = img.bits()
-        ptr.setsize(img.byteCount())
-        arr = np.frombuffer(ptr, np.uint8).reshape((img.height(), img.width(), 4))
-        arr = arr[..., :3]
+        # Decode image via OpenCV
+        buf = np.frombuffer(resp.content, dtype=np.uint8)
+        cv_img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+        # Convert BGR (OpenCV default) to RGB
+        arr = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
         # Display
         h, w, _ = arr.shape
         self.map_item.setImage(arr)
