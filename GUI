@@ -64,7 +64,6 @@ class TelemetryGUI(QMainWindow):
         self.orig_lat = 37.123456
         self.orig_lon = -122.123456
         # Projection: local ENU (meters) -> lat/lon
-        # Replace zone number as appropriate for your location
         utm_zone = int((self.orig_lon + 180) / 6) + 1
         proj_str = f'+proj=utm +zone={utm_zone} +datum=WGS84'
         self.proj = pyproj.Transformer.from_crs(proj_str, 'EPSG:4326', always_xy=True)
@@ -79,7 +78,6 @@ class TelemetryGUI(QMainWindow):
         self.plot = pg.PlotWidget(title='Flight Path')
         self.plot.setAspectLocked(True)
         self.plot.enableAutoRange()
-        # Add map underlay before curve
         self.plot.addItem(self.map_item)
         self.map_item.setZValue(-100)
         self.path_curve = self.plot.plot([], [], pen=pg.mkPen(width=2, color='w'))
@@ -105,20 +103,19 @@ class TelemetryGUI(QMainWindow):
         self.timer.start(30)
 
     def gpr_cb(self, msg: Image):
+        """Handle incoming GPR B-scan Image."""
         self.latest_gpr = self.bridge.imgmsg_to_cv2(msg, 'mono8')
 
     def odom_cb(self, msg: VehicleOdometry):
-        # Choose frame: FRD vs NED
+        """Handle VehicleOdometry: frame choice, centering, and yaw rotation."""
         if msg.pose_frame == VehicleOdometry.POSE_FRAME_FRD:
             x, y, _ = msg.position
         else:
             xn, yn, _ = msg.position
             x, y = yn, xn
-        # Origin centering
         if self.origin is None:
             self.origin = (x, y)
         xr, yr = x - self.origin[0], y - self.origin[1]
-        # Yaw from quaternion
         w, xq, yq, zq = msg.q
         yaw = math.atan2(2*(w*zq + xq*yq), 1 - 2*(yq*yq + zq*zq))
         c, s = math.cos(-yaw), math.sin(-yaw)
@@ -126,19 +123,18 @@ class TelemetryGUI(QMainWindow):
         yr2 = xr*s + yr*c
         self.path.append((xr2, yr2))
 
-        def range_cb(self, msg: Range):
+    def range_cb(self, msg: Range):
+        """Handle incoming Range message."""
         self.latest_range = msg.range
 
     def update_map_background(self):
-        # Compute bounding box in local ENU meters
+        """Fetch and display satellite map covering current path extents."""
         xs, ys = zip(*self.path)
         buf = 10.0
         min_x, max_x = min(xs) - buf, max(xs) + buf
         min_y, max_y = min(ys) - buf, max(ys) + buf
-        # Convert ENU -> lat/lon
         ll_lon, ll_lat = self.proj.transform(min_x, min_y)
         ur_lon, ur_lat = self.proj.transform(max_x, max_y)
-        # Fetch static map (Google Static Maps example)
         url = (
             'https://maps.googleapis.com/maps/api/staticmap'
             f'?size=800x800&maptype=satellite&visible={ll_lat},{ll_lon}|{ur_lat},{ur_lon}'
@@ -152,31 +148,25 @@ class TelemetryGUI(QMainWindow):
         if resp.status_code != 200:
             self.node.get_logger().error(f"Map fetch failed: HTTP {resp.status_code}")
             return
-        # Decode image via OpenCV
         buf = np.frombuffer(resp.content, dtype=np.uint8)
         cv_img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
         if cv_img is None:
             self.node.get_logger().error("Failed to decode map image")
             return
         arr = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
-        # Display underlay
-        h, w, _ = arr.shape
         self.map_item.setImage(arr)
         self.map_item.setRect(min_x, min_y, max_x - min_x, max_y - min_y)
         self.map_ready = True
 
-    def update_ui(self):(self):
-        # On first path population, load map
+    def update_ui(self):
+        """Update map background (once), flight path, range label, and GPR image."""
         if not self.map_ready and len(self.path) > 1:
             self.update_map_background()
-        # Draw path
         if self.path:
             xs, ys = zip(*self.path)
             self.path_curve.setData(xs, ys)
-        # Update range
         if self.latest_range is not None:
             self.range_label.setText(f'Range: {self.latest_range:.2f} m')
-        # Update GPR
         if self.latest_gpr is not None:
             img = self.latest_gpr.T
             self.img_view.setImage(img, autoLevels=True)
@@ -185,6 +175,7 @@ class TelemetryGUI(QMainWindow):
             v.setRange(xRange=(0, w), yRange=(0, h), padding=0)
 
     def closeEvent(self, event):
+        """Cleanup ROS and threads on window close."""
         self.executor.shutdown()
         self.spin_thread.join(timeout=1.0)
         self.node.destroy_node()
