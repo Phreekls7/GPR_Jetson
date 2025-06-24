@@ -57,8 +57,9 @@ class TelemetryGUI(QMainWindow):
         self.latest_range = None
 
         # GPR history buffer
-        self.gpr_history = None          # Will hold rolling buffer
-        self.max_history = 800           # Max columns to display/history length
+        self.gpr_history = None          # Rolling buffer array
+        self.history_count = 0          # Filled columns count
+        self.max_history = 800          # Max columns to display/history length
 
         # Map background setup
         self.map_item = pg.ImageItem()
@@ -106,22 +107,26 @@ class TelemetryGUI(QMainWindow):
         self.timer.start(30)
 
     def gpr_cb(self, msg: Image):
-        """Handle incoming GPR B-scan Image and update rolling buffer."""
+        """Handle incoming GPR B-scan Image and update rolling buffer continuously."""
         frame = self.bridge.imgmsg_to_cv2(msg, 'mono8')
         h, w = frame.shape
-        # Initialize history buffer on first message
+        # Initialize buffer on first message
         if self.gpr_history is None:
-            # Buffer dimensions: height x max_history
             self.gpr_history = np.zeros((h, self.max_history), dtype=np.uint8)
-        # Extract single column of new data
+            self.history_count = 0
+        # Extract a single column of new data
         if w > 1:
-            # Downsample horizontally to one column
             col = cv2.resize(frame, (1, h), interpolation=cv2.INTER_AREA)[:, 0]
         else:
             col = frame[:, 0]
-        # Roll buffer left by one and insert new column at end
-        self.gpr_history = np.roll(self.gpr_history, -1, axis=1)
-        self.gpr_history[:, -1] = col
+        # If buffer not yet full, just insert at next index
+        if self.history_count < self.max_history:
+            self.gpr_history[:, self.history_count] = col
+            self.history_count += 1
+        else:
+            # Buffer full: roll left and append new column at end
+            self.gpr_history = np.roll(self.gpr_history, -1, axis=1)
+            self.gpr_history[:, -1] = col
 
     def odom_cb(self, msg: VehicleOdometry):
         """Handle VehicleOdometry: frame choice, centering, and yaw rotation."""
@@ -152,13 +157,11 @@ class TelemetryGUI(QMainWindow):
         min_y, max_y = min(ys) - buf, max(ys) + buf
         ll_lon, ll_lat = self.proj.transform(min_x, min_y)
         ur_lon, ur_lat = self.proj.transform(max_x, max_y)
-        # Google Maps URL (with API key placeholder)
         url_google = (
             'https://maps.googleapis.com/maps/api/staticmap'
             f'?size=800x800&maptype=satellite&visible={ll_lat},{ll_lon}|{ur_lat},{ur_lon}'
             '&key=YOUR_API_KEY'
         )
-        # Fallback: OSM Static Map
         center_lat = (ll_lat + ur_lat) / 2
         center_lon = (ll_lon + ur_lon) / 2
         zoom = 16
@@ -188,7 +191,7 @@ class TelemetryGUI(QMainWindow):
         self.map_ready = True
 
     def update_ui(self):
-        """Update map background (once), flight path, range label, and GPR history view."""
+        """Update map, flight path, range label, and GPR view."""
         if not self.map_ready and len(self.path) > 1:
             self.update_map_background()
         if self.path:
@@ -196,7 +199,7 @@ class TelemetryGUI(QMainWindow):
             self.path_curve.setData(xs, ys)
         if self.latest_range is not None:
             self.range_label.setText(f'Range: {self.latest_range:.2f} m')
-        # Display rolling GPR history
+        # Show current GPR history (may be partially filled)
         if self.gpr_history is not None:
             img = self.gpr_history.T
             self.img_view.setImage(img, autoLevels=True)
@@ -205,7 +208,7 @@ class TelemetryGUI(QMainWindow):
             v.setRange(xRange=(0, w), yRange=(0, h), padding=0)
 
     def closeEvent(self, event):
-        """Cleanup ROS and threads on window close."""
+        """Cleanup ROS and threads on close."""
         self.executor.shutdown()
         self.spin_thread.join(timeout=1.0)
         self.node.destroy_node()
