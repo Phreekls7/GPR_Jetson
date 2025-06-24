@@ -114,16 +114,17 @@ class TelemetryGUI(QMainWindow):
         # Update GPR history plot
         if self.gpr_history is not None:
             H, W = self.gpr_history.shape
-            if W <= self.max_gpr_cols:
-                disp = self.gpr_history
-            else:
-                # downsample horizontally to fit display width
-                disp = cv2.resize(self.gpr_history, (self.max_gpr_cols, H), interpolation=cv2.INTER_AREA)
-            # show as image (transpose so time axis horizontal)
+            # always compress/expand history to fixed width for full visibility
+            disp = cv2.resize(
+                self.gpr_history,
+                (self.max_gpr_cols, H),
+                interpolation=cv2.INTER_AREA
+            )
+            # display as image (time on horizontal axis)
             self.img_view.setImage(disp.T, autoLevels=True)
             v = self.img_view.getView()
-            w_disp = disp.shape[1]
-            v.setRange(xRange=(0, w_disp), yRange=(0, H), padding=0)
+            # fixed width view
+            v.setRange(xRange=(0, self.max_gpr_cols), yRange=(0, H), padding=0))
 
     def closeEvent(self, event):
         self.executor.shutdown()
