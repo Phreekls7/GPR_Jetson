@@ -32,24 +32,13 @@ class TelemetryGUI(QMainWindow):
         self.spin_thread.start()
         self.bridge = CvBridge()
 
-        # --- ROS2 Subscriptions ---
-        odom_qos = QoSProfile(depth=10)
-        odom_qos.reliability = QoSReliabilityPolicy.BEST_EFFORT
-        odom_qos.durability = QoSDurabilityPolicy.VOLATILE
-        self.node.create_subscription(VehicleOdometry,
-                                      '/fmu/out/vehicle_odometry',
-                                      self.odom_cb,
-                                      qos_profile=odom_qos)
-        self.node.create_subscription(Range,
-                                      '/range',
-                                      self.range_cb,
-                                      qos_profile=10)
-        self.node.create_subscription(Image,
-                                      '/gpr/bscan',
-                                      self.gpr_cb,
-                                      qos_profile=10)
+                # --- Internal state ---
+        self.path = []
+        self.origin = None
+        self.latest_range = None
+        self.latest_gpr = None
 
-        # --- Internal state ---
+        # --- ROS2 Subscriptions ---
         self.path = []
         self.origin = None
         self.latest_range = None
