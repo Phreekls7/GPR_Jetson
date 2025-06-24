@@ -62,10 +62,14 @@ class TelemetryGUI(QMainWindow):
         self.latest_gpr = None
         self.latest_range = None
 
-                # Simple background (plain grid)
-        self.plot = pg.PlotWidget(title='Flight Path')
-        self.plot.setBackground('w')  # white background
-        self.plot.showGrid(x=True, y=True)
+        # Map background setup (OpenStreetMap static)
+        self.map_item = pg.ImageItem()
+        self.map_ready = False
+        self.orig_lat = 37.123456
+        self.orig_lon = -122.123456
+        utm_zone = int((self.orig_lon + 180) / 6) + 1
+        proj_str = f'+proj=utm +zone={utm_zone} +datum=WGS84'
+        self.proj = pyproj.Transformer.from_crs(proj_str, 'EPSG:4326', always_xy=True)
 
         # Build UI
         central = QWidget()
