@@ -58,7 +58,6 @@ class TelemetryGUI(QMainWindow):
 
         # GPR history buffer
         self.gpr_history = None          # Rolling buffer array
-        self.history_count = 0          # Filled columns count
         self.max_history = 800          # Max columns to display/history length
 
         # Map background setup
@@ -113,20 +112,14 @@ class TelemetryGUI(QMainWindow):
         # Initialize buffer on first message
         if self.gpr_history is None:
             self.gpr_history = np.zeros((h, self.max_history), dtype=np.uint8)
-            self.history_count = 0
         # Extract a single column of new data
         if w > 1:
             col = cv2.resize(frame, (1, h), interpolation=cv2.INTER_AREA)[:, 0]
         else:
             col = frame[:, 0]
-        # If buffer not yet full, just insert at next index
-        if self.history_count < self.max_history:
-            self.gpr_history[:, self.history_count] = col
-            self.history_count += 1
-        else:
-            # Buffer full: roll left and append new column at end
-            self.gpr_history = np.roll(self.gpr_history, -1, axis=1)
-            self.gpr_history[:, -1] = col
+        # Always roll left and append new data at end
+        self.gpr_history = np.roll(self.gpr_history, -1, axis=1)
+        self.gpr_history[:, -1] = col
 
     def odom_cb(self, msg: VehicleOdometry):
         """Handle VehicleOdometry: frame choice, centering, and yaw rotation."""
@@ -199,7 +192,7 @@ class TelemetryGUI(QMainWindow):
             self.path_curve.setData(xs, ys)
         if self.latest_range is not None:
             self.range_label.setText(f'Range: {self.latest_range:.2f} m')
-        # Show current GPR history (may be partially filled)
+        # Show current GPR history rolling continuously
         if self.gpr_history is not None:
             img = self.gpr_history.T
             self.img_view.setImage(img, autoLevels=True)
