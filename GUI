@@ -1,26 +1,20 @@
+#!/usr/bin/env python3
 import sys
 import threading
 import math
 import rclpy
 from rclpy.node import Node
 from rclpy.executors import SingleThreadedExecutor
-
-# Messages
+from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSDurabilityPolicy
 from px4_msgs.msg import VehicleOdometry
 from sensor_msgs.msg import Image, Range
 from cv_bridge import CvBridge
 
-# QoS
-from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSDurabilityPolicy
-
-# Qt
 from PyQt5.QtWidgets import QApplication, QMainWindow, QWidget, QVBoxLayout, QLabel, QHBoxLayout
 from PyQt5.QtCore import QTimer, Qt
 import pyqtgraph as pg
 import numpy as np
-import cv2  # for decoding map images
-
-# Map and projection
+import cv2
 import requests
 import pyproj
 
@@ -29,57 +23,39 @@ class TelemetryGUI(QMainWindow):
         super().__init__()
         self.setWindowTitle('Drone Telemetry')
 
-        # ROS2 init
+        # --- ROS2 init ---
         rclpy.init(args=None)
         self.node = Node('telemetry_gui')
         self.executor = SingleThreadedExecutor()
         self.executor.add_node(self.node)
         self.spin_thread = threading.Thread(target=self.executor.spin, daemon=True)
         self.spin_thread.start()
-
-        # Bridge for images
         self.bridge = CvBridge()
 
-        # Subscriptions
-        self.node.create_subscription(Image, '/gpr/bscan', self.gpr_cb, qos_profile=10)
-        self.node.create_subscription(Range, '/range', self.range_cb, qos_profile=10)
+        # --- Subscriptions ---
         odom_qos = QoSProfile(depth=10)
         odom_qos.reliability = QoSReliabilityPolicy.BEST_EFFORT
         odom_qos.durability = QoSDurabilityPolicy.VOLATILE
-        self.node.create_subscription(VehicleOdometry,
-                                      '/fmu/out/vehicle_odometry',
-                                      self.odom_cb,
-                                      qos_profile=odom_qos)
+        self.node.create_subscription(VehicleOdometry, '/fmu/out/vehicle_odometry', self.odom_cb, qos_profile=odom_qos)
+        self.node.create_subscription(Range, '/range', self.range_cb, qos_profile=10)
+        self.node.create_subscription(Image, '/gpr/bscan', self.gpr_cb, qos_profile=10)
 
-        # Data containers
+        # --- Data containers ---
         self.path = []
         self.origin = None
-        self.latest_gpr = None
         self.latest_range = None
+        self.gpr_history = None           # full history of GPR traces
+        self.max_gpr_cols = 1000         # display width in pixels
 
-        # Map background setup
-        self.map_item = pg.ImageItem()
-        self.map_ready = False
-        # Geographic origin (set your takeoff coords here)
-        self.orig_lat = 37.123456
-        self.orig_lon = -122.123456
-        # Projection: local ENU (meters) -> lat/lon
-        utm_zone = int((self.orig_lon + 180) / 6) + 1
-        proj_str = f'+proj=utm +zone={utm_zone} +datum=WGS84'
-        self.proj = pyproj.Transformer.from_crs(proj_str, 'EPSG:4326', always_xy=True)
-
-        # Build UI
+        # --- Build UI ---
         central = QWidget()
         self.setCentralWidget(central)
         layout = QVBoxLayout(central)
 
-        # Top: flight path + range (upper half)
+        # Top: flight path + range
         top = QHBoxLayout()
         self.plot = pg.PlotWidget(title='Flight Path')
         self.plot.setAspectLocked(True)
-        self.plot.enableAutoRange()
-        self.plot.addItem(self.map_item)
-        self.map_item.setZValue(-100)
         self.path_curve = self.plot.plot([], [], pen=pg.mkPen(width=2, color='w'))
         top.addWidget(self.plot, stretch=3)
         self.range_label = QLabel('Range: -- m')
@@ -88,110 +64,68 @@ class TelemetryGUI(QMainWindow):
         top.addWidget(self.range_label, stretch=1)
         layout.addLayout(top, stretch=1)
 
-        # Bottom: GPR B-scan (lower half)
+        # Bottom: GPR B-scan history
         self.img_view = pg.ImageView(view=pg.PlotItem())
         for btn in (self.img_view.ui.histogram, self.img_view.ui.roiBtn, self.img_view.ui.menuBtn):
             btn.hide()
-        view = self.img_view.getView()
-        view.enableAutoRange(False)
-        view.setAspectLocked(False)
+        iv = self.img_view.getView()
+        iv.enableAutoRange(False)
+        iv.setAspectLocked(False)
         layout.addWidget(self.img_view, stretch=1)
 
-        # Timer for updates
+        # --- Timer for UI updates ---
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_ui)
-        self.timer.start(30)
+        self.timer.start(30)  # ~33 Hz
 
     def gpr_cb(self, msg: Image):
-        """Handle incoming GPR B-scan Image."""
-        self.latest_gpr = self.bridge.imgmsg_to_cv2(msg, 'mono8')
+        """Receive full B-scan image, extract latest column, and append to history."""
+        img = self.bridge.imgmsg_to_cv2(msg, desired_encoding='mono8')  # shape (H, W)
+        col = img[:, -1]  # newest trace
+        col = col[:, np.newaxis]
+        if self.gpr_history is None:
+            self.gpr_history = col
+        else:
+            self.gpr_history = np.concatenate((self.gpr_history, col), axis=1)
 
     def odom_cb(self, msg: VehicleOdometry):
-        """Handle VehicleOdometry: frame choice, centering, and yaw rotation."""
-        if msg.pose_frame == VehicleOdometry.POSE_FRAME_FRD:
-            x, y, _ = msg.position
-        else:
-            xn, yn, _ = msg.position
-            x, y = yn, xn
+        x, y, _ = msg.position if msg.pose_frame == VehicleOdometry.POSE_FRAME_FRD else (msg.position[1], msg.position[0], None)
         if self.origin is None:
             self.origin = (x, y)
         xr, yr = x - self.origin[0], y - self.origin[1]
         w, xq, yq, zq = msg.q
         yaw = math.atan2(2*(w*zq + xq*yq), 1 - 2*(yq*yq + zq*zq))
         c, s = math.cos(-yaw), math.sin(-yaw)
-        xr2 = xr*c - yr*s
-        yr2 = xr*s + yr*c
-        self.path.append((xr2, yr2))
+        self.path.append((xr*c - yr*s, xr*s + yr*c))
 
     def range_cb(self, msg: Range):
-        """Handle incoming Range message."""
         self.latest_range = msg.range
 
-    def update_map_background(self):
-        """Fetch and display satellite map covering current path extents."""
-        xs, ys = zip(*self.path)
-        buf = 10.0
-        min_x, max_x = min(xs) - buf, max(xs) + buf
-        min_y, max_y = min(ys) - buf, max(ys) + buf
-        ll_lon, ll_lat = self.proj.transform(min_x, min_y)
-        ur_lon, ur_lat = self.proj.transform(max_x, max_y)
-                # Try Google Static Maps (requires API key)
-        url_google = (
-            'https://maps.googleapis.com/maps/api/staticmap'
-            f'?size=800x800&maptype=satellite&visible={ll_lat},{ll_lon}|{ur_lat},{ur_lon}'
-            '&key=YOUR_API_KEY'
-        )
-        # Fallback: OpenStreetMap Static Map
-        # Calculate center and approximate zoom
-        center_lat = (ll_lat + ur_lat) / 2
-        center_lon = (ll_lon + ur_lon) / 2
-        zoom = 16  # adjust as needed
-        url_osm = (
-            'https://staticmap.openstreetmap.de/staticmap.php'
-            f'?center={center_lat},{center_lon}'
-            f'&zoom={zoom}&size=800x800'
-        )
-        # Fetch map: try Google first, then OSM
-        for url in (url_google, url_osm):
-            try:
-                resp = requests.get(url, timeout=10)
-                if resp.status_code == 200:
-                    break
-            except Exception:
-                continue
-        else:
-            self.node.get_logger().error(f"Map fetch failed on both services: HTTP {[resp.status_code if 'resp' in locals() else 'n/a']}")
-            return
-        # Decode image via OpenCV
-        buf = np.frombuffer(resp.content, dtype=np.uint8)
-        cv_img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
-        if cv_img is None:
-            self.node.get_logger().error("Failed to decode map image")
-            return
-        arr = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
-        # Display underlay
-        self.map_item.setImage(arr)
-        self.map_item.setRect(min_x, min_y, max_x - min_x, max_y - min_y)
-        self.map_ready = True
-
     def update_ui(self):
-        """Update map background (once), flight path, range label, and GPR image."""
-        if not self.map_ready and len(self.path) > 1:
-            self.update_map_background()
+        # Update flight path
         if self.path:
             xs, ys = zip(*self.path)
             self.path_curve.setData(xs, ys)
+
+        # Update range label
         if self.latest_range is not None:
             self.range_label.setText(f'Range: {self.latest_range:.2f} m')
-        if self.latest_gpr is not None:
-            img = self.latest_gpr.T
-            self.img_view.setImage(img, autoLevels=True)
-            h, w = img.shape
+
+        # Update GPR history plot
+        if self.gpr_history is not None:
+            H, W = self.gpr_history.shape
+            if W <= self.max_gpr_cols:
+                disp = self.gpr_history
+            else:
+                # downsample horizontally to fit display width
+                disp = cv2.resize(self.gpr_history, (self.max_gpr_cols, H), interpolation=cv2.INTER_AREA)
+            # show as image (transpose so time axis horizontal)
+            self.img_view.setImage(disp.T, autoLevels=True)
             v = self.img_view.getView()
-            v.setRange(xRange=(0, w), yRange=(0, h), padding=0)
+            w_disp = disp.shape[1]
+            v.setRange(xRange=(0, w_disp), yRange=(0, H), padding=0)
 
     def closeEvent(self, event):
-        """Cleanup ROS and threads on window close."""
         self.executor.shutdown()
         self.spin_thread.join(timeout=1.0)
         self.node.destroy_node()
