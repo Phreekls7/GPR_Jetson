@@ -96,8 +96,10 @@ class TelemetryGUI(QMainWindow):
         top.addWidget(self.range_label, stretch=1)
         layout.addLayout(top, stretch=1)
 
-        # GPR display
+                # GPR display
         self.img_view = pg.ImageView()
+        # ensure the GPR view has more vertical space
+        self.img_view.setMinimumHeight(400)
         for btn in (self.img_view.ui.histogram,
                     self.img_view.ui.roiBtn,
                     self.img_view.ui.menuBtn):
@@ -105,9 +107,10 @@ class TelemetryGUI(QMainWindow):
         view = self.img_view.getView()
         view.enableAutoRange(False)
         view.setAspectLocked(False)
-        layout.addWidget(self.img_view, stretch=1)
+-        layout.addWidget(self.img_view, stretch=1)
++        layout.addWidget(self.img_view, stretch=3)
 
-        # Timer for updates (~30Hz)
+        # Timer for updates (~30Hz) (~30Hz)
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.update_ui)
         self.timer.start(33)
