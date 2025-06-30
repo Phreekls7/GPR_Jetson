@@ -23,11 +23,12 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import QTimer, Qt
 import pyqtgraph as pg
 import numpy as np
-import cv2  # for decoding map images
+import cv2
 
-# Map and projection
+# For map projection (unchanged)
 import requests
 import pyproj
+
 
 class TelemetryGUI(QMainWindow):
     def __init__(self):
@@ -35,27 +36,30 @@ class TelemetryGUI(QMainWindow):
         self.setWindowTitle('Drone Telemetry')
 
         # ROS2 init
-        rclpy.init(args=None)
+        rclpy.init()
         self.node = Node('telemetry_gui')
         self.executor = SingleThreadedExecutor()
         self.executor.add_node(self.node)
-        self.spin_thread = threading.Thread(
-            target=self.executor.spin, daemon=True)
-        self.spin_thread.start()
+        threading.Thread(target=self.executor.spin, daemon=True).start()
 
         # Bridge for images
         self.bridge = CvBridge()
 
-        # Data containers
+        # Flight‐path containers
         self.path = []
         self.origin = None
+
+        # GPR & laser data
         self.latest_gpr = None
         self.latest_range = None
 
-        # How many pixels per meter of range offset
+        # Establish baseline on first laser reading
+        self.base_range = None
+
+        # How many pixels shift per meter of ground offset
         self.pix_per_m = 20
 
-        # QoS for subscriptions
+        # QoS
         qos = QoSProfile(depth=10)
         qos.reliability = QoSReliabilityPolicy.BEST_EFFORT
         qos.durability = QoSDurabilityPolicy.VOLATILE
@@ -71,10 +75,9 @@ class TelemetryGUI(QMainWindow):
             self.odom_cb,
             qos)
 
-        # Map background setup (OpenStreetMap static)
+        # Map background (unchanged except quick OSM)
         self.map_item = pg.ImageItem()
         self.map_ready = False
-        # takeoff coords
         self.orig_lat = 37.123456
         self.orig_lon = -122.123456
         utm_zone = int((self.orig_lon + 180) / 6) + 1
@@ -82,12 +85,12 @@ class TelemetryGUI(QMainWindow):
         self.proj = pyproj.Transformer.from_crs(
             proj_str, 'EPSG:4326', always_xy=True)
 
-        # Build UI
+        # ---- Build UI ----
         central = QWidget()
         self.setCentralWidget(central)
         layout = QVBoxLayout(central)
 
-        # Flight path + range label
+        # Flight path + Range label
         top = QHBoxLayout()
         self.plot = pg.PlotWidget(title='Flight Path')
         self.plot.setAspectLocked(True)
@@ -101,7 +104,6 @@ class TelemetryGUI(QMainWindow):
         self.range_label = QLabel('Range: -- m')
         self.range_label.setAlignment(Qt.AlignCenter)
         top.addWidget(self.range_label, stretch=1)
-
         layout.addLayout(top, stretch=1)
 
         # GPR B-scan view
@@ -110,26 +112,28 @@ class TelemetryGUI(QMainWindow):
                     self.img_view.ui.roiBtn,
                     self.img_view.ui.menuBtn):
             btn.hide()
-        view = self.img_view.getView()
-        view.enableAutoRange(False)
-        view.setAspectLocked(False)
+        v = self.img_view.getView()
+        v.enableAutoRange(False)
+        v.setAspectLocked(False)
         layout.addWidget(self.img_view, stretch=1)
 
-        # Timer for UI updates (~30 Hz)
+        # UI Timer (~30 Hz)
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_ui)
         self.timer.start(33)
 
     def gpr_cb(self, msg: Image):
-        """Handle incoming GPR B-scan Image."""
+        """Store the latest raw GPR B-scan frame."""
         self.latest_gpr = self.bridge.imgmsg_to_cv2(msg, 'mono8')
 
     def range_cb(self, msg: Range):
-        """Handle incoming Range message."""
+        """Store the latest laser range, and establish baseline."""
         self.latest_range = msg.range
+        if self.base_range is None:
+            self.base_range = msg.range
 
     def odom_cb(self, msg: VehicleOdometry):
-        """Handle VehicleOdometry: centering, yaw-rotation."""
+        """Record flight path, same as before."""
         if msg.pose_frame == VehicleOdometry.POSE_FRAME_FRD:
             x, y, _ = msg.position
         else:
@@ -147,7 +151,7 @@ class TelemetryGUI(QMainWindow):
         self.path.append((xr2, yr2))
 
     def update_map_background(self):
-        """Fetch and display a simple OSM static map."""
+        """Fetch OSM static map, unchanged from before."""
         xs, ys = zip(*self.path)
         buf = 10.0
         min_x, max_x = min(xs)-buf, max(xs)+buf
@@ -170,13 +174,13 @@ class TelemetryGUI(QMainWindow):
             rgb = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
             self.map_item.setImage(rgb)
             self.map_item.setRect(
-                min_x, min_y, max_x-min_x, max_y-min_y)
+                min_x, min_y, max_x-min_x, max(ys)-min_y)
             self.map_ready = True
-        except Exception:
+        except:
             self.node.get_logger().error('Failed to fetch map')
 
     def update_ui(self):
-        """Update flight path, range label, and GPR B-scan (with offset)."""
+        """Draw path, range, and GPR B-scan with baseline offset."""
         # Flight path
         if not self.map_ready and len(self.path) > 1:
             self.update_map_background()
@@ -191,25 +195,20 @@ class TelemetryGUI(QMainWindow):
 
         # GPR B-scan
         if self.latest_gpr is not None:
-            img_raw = self.latest_gpr
-            # compute vertical offset in pixels
-            if self.latest_range is not None:
-                offset_px = int(self.latest_range * self.pix_per_m)
-                img_shifted = np.roll(img_raw, -offset_px, axis=0)
-            else:
-                img_shifted = img_raw
-            # transpose for display
-            disp = img_shifted.T
+            img = self.latest_gpr
+            if self.latest_range is not None and self.base_range is not None:
+                # offset = difference from baseline
+                delta = self.latest_range - self.base_range
+                shift_px = int(delta * self.pix_per_m)
+                img = np.roll(img, -shift_px, axis=0)
+            disp = img.T
             self.img_view.setImage(disp, autoLevels=True)
-            # lock the view so it doesn't auto-zoom on updates
             h, w = disp.shape
-            view = self.img_view.getView()
-            view.setRange(xRange=(0, w),
-                          yRange=(0, h),
-                          padding=0)
+            v = self.img_view.getView()
+            v.setRange(xRange=(0, w), yRange=(0, h), padding=0)
 
     def closeEvent(self, event):
-        """Cleanup ROS and threads on window close."""
+        """Clean up on exit."""
         self.executor.shutdown()
         self.spin_thread.join(timeout=1.0)
         self.node.destroy_node()
