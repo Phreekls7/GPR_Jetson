@@ -20,6 +20,7 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import QTimer, Qt
 import pyqtgraph as pg
 import numpy as np
+import cv2
 
 
 class TelemetryGUI(QMainWindow):
@@ -34,54 +35,66 @@ class TelemetryGUI(QMainWindow):
         self.executor.add_node(self.node)
         threading.Thread(target=self.executor.spin, daemon=True).start()
 
-        # bridge
+        # CvBridge
         self.bridge = CvBridge()
 
-        # flight path
+        # Flight path
         self.path = []
         self.origin = None
 
-        # GPR & LiDAR
-        self.latest_gpr    = None      # raw mono8 image (2D)
-        self.latest_range  = None      # float
-        self.base_range    = None
-        self.mount_offset  = 0.40      # m: lidar minus GPR
-        self.pix_per_m     = 50        # px per meter
+        # GPR & LiDAR state
+        self.latest_gpr    = None  # 2D numpy mono8
+        self.latest_range  = None  # float
+        self.base_range    = None  # float
+        self.mount_offset  = 0.40  # m
+        self.pix_per_m     = 50    # px/m
+        # vertical scale factor for display
+        self.vert_scale    = 0.5   # compress to 50% height
 
-        # history of range readings per-trace
-        self.range_hist = None         # will become deque(maxlen=width)
+        # history of ground distances per column
+        self.range_hist = None  # will be deque(maxlen=width)
 
         # QoS
         qos = QoSProfile(depth=10)
         qos.reliability = QoSReliabilityPolicy.BEST_EFFORT
-        qos.durability   = QoSDurabilityPolicy.VOLATILE
+        qos.durability = QoSDurabilityPolicy.VOLATILE
 
-        # subs
-        self.node.create_subscription(Image,
-            '/gpr/bscan', self.gpr_cb, qos)
-        self.node.create_subscription(DistanceSensor,
-            '/fmu/out/distance_sensor', self.range_cb, qos)
-        self.node.create_subscription(VehicleOdometry,
-            '/fmu/out/vehicle_odometry', self.odom_cb, qos)
+        # Subscriptions
+        self.node.create_subscription(
+            Image,
+            '/gpr/bscan',
+            self.gpr_cb,
+            qos)
+        self.node.create_subscription(
+            DistanceSensor,
+            '/fmu/out/distance_sensor',
+            self.range_cb,
+            qos)
+        self.node.create_subscription(
+            VehicleOdometry,
+            '/fmu/out/vehicle_odometry',
+            self.odom_cb,
+            qos)
 
-        # UI
+        # Build UI
         central = QWidget()
         self.setCentralWidget(central)
         layout = QVBoxLayout(central)
 
-        # flight path + range
+        # Flight path + range label
         top = QHBoxLayout()
         self.plot = pg.PlotWidget(title='Flight Path')
         self.plot.setBackground('w')
         self.plot.showGrid(True, True)
         self.path_curve = self.plot.plot([], [], pen=pg.mkPen('b', width=2))
         top.addWidget(self.plot, stretch=3)
+
         self.range_label = QLabel('Range: -- m')
         self.range_label.setAlignment(Qt.AlignCenter)
         top.addWidget(self.range_label, stretch=1)
         layout.addLayout(top, stretch=1)
 
-        # GPR display
+        # GPR B-scan view
         self.img_view = pg.ImageView()
         for btn in (self.img_view.ui.histogram,
                     self.img_view.ui.roiBtn,
@@ -92,25 +105,25 @@ class TelemetryGUI(QMainWindow):
         v.setAspectLocked(False)
         layout.addWidget(self.img_view, stretch=1)
 
-        # timer ~30Hz
+        # Timer for updates
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.update_ui)
         self.timer.start(33)
 
     def gpr_cb(self, msg: Image):
-        # convert to mono8 numpy
+        # Convert ROS Image to numpy
         img = self.bridge.imgmsg_to_cv2(msg, 'mono8')
         h, w = img.shape
-
-        # initialize history on first frame
+        # Init range history deque on first frame
         if self.range_hist is None:
-            # baseline fill with base_range if known, else zeros
-            init = self.base_range if self.base_range is not None else 0.0
+            init = (self.base_range or 0.0) - self.mount_offset
             self.range_hist = collections.deque([init]*w, maxlen=w)
-
-        # append current_range for this new trace (column)
-        self.range_hist.append(self.latest_range or self.base_range or 0.0)
-
+        # Append current ground distance
+        if self.latest_range is not None:
+            ground = self.latest_range - self.mount_offset
+        else:
+            ground = (self.base_range or 0.0) - self.mount_offset
+        self.range_hist.append(ground)
         self.latest_gpr = img
 
     def range_cb(self, msg: DistanceSensor):
@@ -122,45 +135,61 @@ class TelemetryGUI(QMainWindow):
         if msg.pose_frame == VehicleOdometry.POSE_FRAME_FRD:
             x, y, _ = msg.position
         else:
-            xn, yn, _ = msg.position; x, y = yn, xn
+            xn, yn, _ = msg.position
+            x, y = yn, xn
         if self.origin is None:
             self.origin = (x, y)
         dx, dy = x - self.origin[0], y - self.origin[1]
         w, xq, yq, zq = msg.q
-        yaw = math.atan2(2*(w*zq + xq*yq),
-                          1 - 2*(yq*yq + zq*zq))
+        yaw = math.atan2(
+            2*(w*zq + xq*yq),
+            1 - 2*(yq*yq + zq*zq)
+        )
         c, s = math.cos(-yaw), math.sin(-yaw)
         fx = dx*c - dy*s
         fy = dx*s + dy*c
         self.path.append((fx, fy))
 
     def update_ui(self):
-        # flight path
+        # Flight path
         if self.path:
             xs, ys = zip(*self.path)
             self.path_curve.setData(xs, ys)
-
-        # range label
+        # Range label
         if self.latest_range is not None:
-            self.range_label.setText(f'Range: {self.latest_range:.2f} m')
-
-        # gpr data shifting
+            self.range_label.setText(
+                f'Range: {self.latest_range:.2f} m'
+            )
+        # GPR B-scan with one-way shift & vertical scaling
         if self.latest_gpr is not None and self.range_hist is not None:
             img = self.latest_gpr.copy()
             h, w = img.shape
-            # build a new image by shifting each column
             shifted = np.zeros_like(img)
             for j in range(w):
-                # true GPR-to-ground distance at that trace
-                d_gpr = (self.range_hist[j] or 0.0) - self.mount_offset
-                delta  = d_gpr - ((self.base_range or 0.0) - self.mount_offset)
-                off_px = int(delta * self.pix_per_m)
-                shifted[:, j] = np.roll(img[:, j], -off_px, axis=0)
-
-            disp = shifted.T
+                delta = self.range_hist[j] - self.base_range
+                off = int(delta * self.pix_per_m)
+                # one-way no-wrap shift
+                if off > 0:
+                    n = min(off, h)
+                    shifted[0:h-n, j] = img[n:h, j]
+                elif off < 0:
+                    n = min(-off, h)
+                    shifted[n:h, j] = img[0:h-n, j]
+                else:
+                    shifted[:, j] = img[:, j]
+            # vertical scaling
+            new_h = int(h * self.vert_scale)
+            resized = cv2.resize(
+                shifted,
+                (w, new_h),
+                interpolation=cv2.INTER_AREA
+            )
+            disp = resized.T
             self.img_view.setImage(disp, autoLevels=True)
+            h2, w2 = disp.shape
             self.img_view.getView().setRange(
-                xRange=(0, w), yRange=(0, h), padding=0)
+                xRange=(0, w2), yRange=(0, h2), padding=0
+            )
 
     def closeEvent(self, event):
         self.executor.shutdown()
