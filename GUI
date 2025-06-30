@@ -2,15 +2,14 @@
 import sys
 import threading
 import math
-import collections
 
 import rclpy
 from rclpy.node import Node
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSDurabilityPolicy
 
-from px4_msgs.msg import VehicleOdometry, DistanceSensor
-from sensor_msgs.msg import Image
+from px4_msgs.msg import VehicleOdometry
+from sensor_msgs.msg import Image, Range
 from cv_bridge import CvBridge
 
 from PyQt5.QtWidgets import (
@@ -20,6 +19,9 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import QTimer, Qt
 import pyqtgraph as pg
 import numpy as np
+import requests
+import cv2
+import pyproj
 
 
 class TelemetryGUI(QMainWindow):
@@ -27,62 +29,70 @@ class TelemetryGUI(QMainWindow):
         super().__init__()
         self.setWindowTitle('Drone Telemetry')
 
-        # ROS2 setup
+        # --- ROS2 setup ---
         rclpy.init()
         self.node = Node('telemetry_gui')
         self.executor = SingleThreadedExecutor()
         self.executor.add_node(self.node)
         threading.Thread(target=self.executor.spin, daemon=True).start()
 
-        # bridge
         self.bridge = CvBridge()
-
-        # flight path
         self.path = []
         self.origin = None
 
-        # GPR & LiDAR
-        self.latest_gpr    = None      # raw mono8 image (2D)
-        self.latest_range  = None      # float
-        self.base_range    = None
-        self.mount_offset  = 0.40      # m: lidar minus GPR
-        self.pix_per_m     = 50        # px per meter
-
-        # history of range readings per-trace
-        self.range_hist = None         # will become deque(maxlen=width)
+        # Latest GPR & LiDAR readings
+        self.latest_gpr   = None
+        self.latest_range = None
+        self.base_range   = None  # baseline on first reading
+        self.pix_per_m    = 50    # adjust: pixels per meter
 
         # QoS
         qos = QoSProfile(depth=10)
         qos.reliability = QoSReliabilityPolicy.BEST_EFFORT
         qos.durability   = QoSDurabilityPolicy.VOLATILE
 
-        # subs
-        self.node.create_subscription(Image,
-            '/gpr/bscan', self.gpr_cb, qos)
-        self.node.create_subscription(DistanceSensor,
-            '/fmu/out/distance_sensor', self.range_cb, qos)
+        # Subscriptions
+        self.node.create_subscription(Image, '/gpr/bscan', self.gpr_cb, qos)
+        self.node.create_subscription(Range, '/range',     self.range_cb, qos)
         self.node.create_subscription(VehicleOdometry,
-            '/fmu/out/vehicle_odometry', self.odom_cb, qos)
+                                      '/fmu/out/vehicle_odometry',
+                                      self.odom_cb,
+                                      qos)
 
-        # UI
+        # Map background (OpenStreetMap static)
+        self.map_item  = pg.ImageItem()
+        self.map_ready = False
+        # set your takeoff lat/lon:
+        self.orig_lat = 37.123456
+        self.orig_lon = -122.123456
+        utm_zone = int((self.orig_lon + 180) / 6) + 1
+        proj_str = f'+proj=utm +zone={utm_zone} +datum=WGS84'
+        self.proj = pyproj.Transformer.from_crs(
+            proj_str, 'EPSG:4326', always_xy=True)
+
+        # --- Build UI ---
         central = QWidget()
         self.setCentralWidget(central)
         layout = QVBoxLayout(central)
 
-        # flight path + range
+        # Flight path + range label
         top = QHBoxLayout()
         self.plot = pg.PlotWidget(title='Flight Path')
-        self.plot.setBackground('w')
+        self.plot.setAspectLocked(True)
         self.plot.showGrid(True, True)
-        self.path_curve = self.plot.plot([], [], pen=pg.mkPen('b', width=2))
+        self.plot.addItem(self.map_item)
+        self.map_item.setZValue(-100)
+        self.path_curve = self.plot.plot(
+            [], [], pen=pg.mkPen(width=2, color='w'))
         top.addWidget(self.plot, stretch=3)
+
         self.range_label = QLabel('Range: -- m')
         self.range_label.setAlignment(Qt.AlignCenter)
         top.addWidget(self.range_label, stretch=1)
         layout.addLayout(top, stretch=1)
 
-        # GPR display
-        self.img_view = pg.ImageView()
+        # GPR B-scan viewer
+        self.img_view = pg.ImageView(view=pg.PlotItem())
         for btn in (self.img_view.ui.histogram,
                     self.img_view.ui.roiBtn,
                     self.img_view.ui.menuBtn):
@@ -92,37 +102,28 @@ class TelemetryGUI(QMainWindow):
         v.setAspectLocked(False)
         layout.addWidget(self.img_view, stretch=1)
 
-        # timer ~30Hz
+        # Timer for UI updates (~30 Hz)
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.update_ui)
         self.timer.start(33)
 
     def gpr_cb(self, msg: Image):
-        # convert to mono8 numpy
-        img = self.bridge.imgmsg_to_cv2(msg, 'mono8')
-        h, w = img.shape
+        """Receive raw B-scan."""
+        self.latest_gpr = self.bridge.imgmsg_to_cv2(msg, 'mono8')
 
-        # initialize history on first frame
-        if self.range_hist is None:
-            # baseline fill with base_range if known, else zeros
-            init = self.base_range if self.base_range is not None else 0.0
-            self.range_hist = collections.deque([init]*w, maxlen=w)
-
-        # append current_range for this new trace (column)
-        self.range_hist.append(self.latest_range or self.base_range or 0.0)
-
-        self.latest_gpr = img
-
-    def range_cb(self, msg: DistanceSensor):
-        self.latest_range = msg.current_distance
+    def range_cb(self, msg: Range):
+        """Receive LiDAR range; set baseline on first read."""
+        self.latest_range = msg.range
         if self.base_range is None:
-            self.base_range = msg.current_distance
+            self.base_range = msg.range
 
     def odom_cb(self, msg: VehicleOdometry):
+        """Record flight path for plotting."""
         if msg.pose_frame == VehicleOdometry.POSE_FRAME_FRD:
             x, y, _ = msg.position
         else:
-            xn, yn, _ = msg.position; x, y = yn, xn
+            xn, yn, _ = msg.position
+            x, y = yn, xn
         if self.origin is None:
             self.origin = (x, y)
         dx, dy = x - self.origin[0], y - self.origin[1]
@@ -134,17 +135,57 @@ class TelemetryGUI(QMainWindow):
         fy = dx*s + dy*c
         self.path.append((fx, fy))
 
-        def update_ui(self):
-        # … flight‐path and range label code …
+    def update_map_background(self):
+        """Fetch and display an OSM static map underlay."""
+        xs, ys = zip(*self.path)
+        buf = 10.0
+        min_x, max_x = min(xs)-buf, max(xs)+buf
+        min_y, max_y = min(ys)-buf, max(ys)+buf
+        ll_lon, ll_lat = self.proj.transform(min_x, min_y)
+        ur_lon, ur_lat = self.proj.transform(max_x, max_y)
+        center_lat = (ll_lat+ur_lat)/2
+        center_lon = (ll_lon+ur_lon)/2
+        zoom = 15
+        url = (
+            'https://staticmap.openstreetmap.de/staticmap.php'
+            f'?center={center_lat},{center_lon}'
+            f'&zoom={zoom}&size=800x800'
+        )
+        try:
+            resp = requests.get(url, timeout=5)
+            resp.raise_for_status()
+            arr = np.frombuffer(resp.content, np.uint8)
+            cv_img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            rgb = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
+            self.map_item.setImage(rgb)
+            self.map_item.setRect(
+                min_x, min_y, max_x-min_x, max(ys)-min_y)
+            self.map_ready = True
+        except:
+            self.node.get_logger().error('Failed to fetch map')
 
+    def update_ui(self):
+        """Refresh flight path, range label, and leveled GPR B-scan."""
+        # Flight path
+        if not self.map_ready and len(self.path) > 1:
+            self.update_map_background()
+        if self.path:
+            xs, ys = zip(*self.path)
+            self.path_curve.setData(xs, ys)
+
+        # Range label
+        if self.latest_range is not None:
+            self.range_label.setText(
+                f'Range: {self.latest_range:.2f} m')
+
+        # GPR B-scan leveling (no wrap)
         if self.latest_gpr is not None:
             img = self.latest_gpr.copy()
-
-            # non‐circular shift so ground stays at top without wrap
-            if self.latest_range is not None and self.base_range is not None:
-                delta = self.latest_range - self.base_range
-                shift = int(delta * self.pix_per_m)
-                h, w = img.shape
+            if (self.latest_range is not None and
+                self.base_range   is not None):
+                delta   = self.latest_range - self.base_range
+                shift   = int(delta * self.pix_per_m)
+                h, w    = img.shape
                 shifted = np.zeros_like(img)
                 if shift > 0:
                     n = min(shift, h)
