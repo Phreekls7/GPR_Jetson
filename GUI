@@ -23,54 +23,50 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import QTimer, Qt
 import pyqtgraph as pg
 import numpy as np
-
-# Map & projection (unchanged)
 import requests
+import cv2  # for map decoding
 import pyproj
-
 
 class TelemetryGUI(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle('Drone Telemetry')
 
-        # --- ROS2 setup ---
+        # Initialize ROS
         rclpy.init()
         self.node = Node('telemetry_gui')
         self.executor = SingleThreadedExecutor()
         self.executor.add_node(self.node)
         threading.Thread(target=self.executor.spin, daemon=True).start()
 
-        # bridge
+        # Bridge
         self.bridge = CvBridge()
 
-        # flight path
+        # Flight path
         self.path = []
         self.origin = None
 
-        # latest readings
-        self.latest_gpr_raw = None      # raw mono8 array from topic
-        self.latest_range = None        # float, from /range
-        self.base_range = None          # will capture first range to define “ground level”
-
-        # how many pixels to shift per meter of change
-        self.pix_per_m = 20
+        # GPR and laser
+        self.latest_gpr = None
+        self.latest_range = None
+        self.base_range = None
+        # pixel shift per meter
+        self.pix_per_m = 50  # adjust as needed
 
         # QoS
         qos = QoSProfile(depth=10)
         qos.reliability = QoSReliabilityPolicy.BEST_EFFORT
         qos.durability   = QoSDurabilityPolicy.VOLATILE
 
-        # subscriptions
-        self.node.create_subscription(
-            Image, '/gpr/bscan', self.gpr_cb, qos)
-        self.node.create_subscription(
-            Range, '/range', self.range_cb, qos)
-        self.node.create_subscription(
-            VehicleOdometry, '/fmu/out/vehicle_odometry',
-            self.odom_cb, qos)
+        # Subscriptions
+        self.node.create_subscription(Image,
+            '/gpr/bscan', self.gpr_cb, qos)
+        self.node.create_subscription(Range,
+            '/range', self.range_cb, qos)
+        self.node.create_subscription(VehicleOdometry,
+            '/fmu/out/vehicle_odometry', self.odom_cb, qos)
 
-        # map background (unchanged)
+        # Map background (OSM static)
         self.map_item = pg.ImageItem()
         self.map_ready = False
         self.orig_lat = 37.123456
@@ -80,12 +76,12 @@ class TelemetryGUI(QMainWindow):
         self.proj = pyproj.Transformer.from_crs(
             proj_str, 'EPSG:4326', always_xy=True)
 
-        # --- Build UI ---
+        # Build UI
         central = QWidget()
         self.setCentralWidget(central)
         layout = QVBoxLayout(central)
 
-        # flight path + range label
+        # Top: flight path + range
         top = QHBoxLayout()
         self.plot = pg.PlotWidget(title='Flight Path')
         self.plot.setAspectLocked(True)
@@ -99,10 +95,9 @@ class TelemetryGUI(QMainWindow):
         self.range_label = QLabel('Range: -- m')
         self.range_label.setAlignment(Qt.AlignCenter)
         top.addWidget(self.range_label, stretch=1)
-
         layout.addLayout(top, stretch=1)
 
-        # GPR B-scan viewer
+        # Bottom: GPR B-scan
         self.img_view = pg.ImageView(view=pg.PlotItem())
         for btn in (self.img_view.ui.histogram,
                     self.img_view.ui.roiBtn,
@@ -113,29 +108,27 @@ class TelemetryGUI(QMainWindow):
         v.setAspectLocked(False)
         layout.addWidget(self.img_view, stretch=1)
 
-        # UI timer (~30 Hz)
+        # UI Timer
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.update_ui)
         self.timer.start(33)
 
     def gpr_cb(self, msg: Image):
-        """Grab raw mono8, but don’t display yet."""
-        raw = self.bridge.imgmsg_to_cv2(msg, 'mono8')
-        self.latest_gpr_raw = raw
+        """Receive raw B-scan."""
+        self.latest_gpr = self.bridge.imgmsg_to_cv2(msg, 'mono8')
 
     def range_cb(self, msg: Range):
-        """Keep track of laser; set baseline on first reading."""
+        """Receive laser range; set baseline on first read."""
         self.latest_range = msg.range
         if self.base_range is None:
             self.base_range = msg.range
 
     def odom_cb(self, msg: VehicleOdometry):
-        """Record flight path."""
+        """Receive odometry for flight path."""
         if msg.pose_frame == VehicleOdometry.POSE_FRAME_FRD:
             x, y, _ = msg.position
         else:
-            xn, yn, _ = msg.position
-            x, y = yn, xn
+            xn, yn, _ = msg.position; x, y = yn, xn
         if self.origin is None:
             self.origin = (x, y)
         xr, yr = x - self.origin[0], y - self.origin[1]
@@ -154,8 +147,8 @@ class TelemetryGUI(QMainWindow):
         min_y, max_y = min(ys)-buf, max(ys)+buf
         ll_lon, ll_lat = self.proj.transform(min_x, min_y)
         ur_lon, ur_lat = self.proj.transform(max_x, max_y)
-        center_lat = (ll_lat+ur_lat)/2
-        center_lon = (ll_lon+ur_lon)/2
+        center_lat = (ll_lat + ur_lat) / 2
+        center_lon = (ll_lon + ur_lon) / 2
         zoom = 15
         url = (
             'https://staticmap.openstreetmap.de/staticmap.php'
@@ -169,35 +162,33 @@ class TelemetryGUI(QMainWindow):
             cv_img = cv2.imdecode(buf_img, cv2.IMREAD_COLOR)
             rgb = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
             self.map_item.setImage(rgb)
-            self.map_item.setRect(
-                min_x, min_y, max_x-min_x, max(ys)-min_y)
+            self.map_item.setRect(min_x, min_y,
+                                  max_x-min_x, max(ys)-min_y)
             self.map_ready = True
         except:
             self.node.get_logger().error('Failed to fetch map')
 
     def update_ui(self):
-        # flight path
-        if not self.map_ready and len(self.path) > 1:
+        # Flight path
+        if not self.map_ready and len(self.path)>1:
             self.update_map_background()
         if self.path:
             xs, ys = zip(*self.path)
             self.path_curve.setData(xs, ys)
 
-        # range label
+        # Range label
         if self.latest_range is not None:
             self.range_label.setText(
                 f'Range: {self.latest_range:.2f} m')
 
-        # GPR B-scan with ground‐level alignment
-        if self.latest_gpr_raw is not None:
-            img = self.latest_gpr_raw.copy()
-
-            # compute offset relative to baseline
+        # GPR B-scan + leveling
+        if self.latest_gpr is not None:
+            img = self.latest_gpr.copy()
             if self.latest_range is not None and self.base_range is not None:
-                delta = self.latest_range - self.base_range
-                shift = int(delta * self.pix_per_m)
-                img = np.roll(img, -shift, axis=0)
-
+                # shift so ground stays at fixed row
+                delta = self.base_range - self.latest_range
+                shift_px = int(delta * self.pix_per_m)
+                img = np.roll(img, shift_px, axis=0)
             disp = img.T
             self.img_view.setImage(disp, autoLevels=True)
             h, w = disp.shape
@@ -209,7 +200,6 @@ class TelemetryGUI(QMainWindow):
         self.node.destroy_node()
         rclpy.shutdown()
         event.accept()
-
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
