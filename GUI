@@ -2,221 +2,210 @@
 import sys
 import threading
 import math
-
+import socket
+import binascii
+import gc
 import rclpy
 from rclpy.node import Node
 from rclpy.executors import SingleThreadedExecutor
 
 # Messages
 from px4_msgs.msg import VehicleOdometry
-from sensor_msgs.msg import Image, Range
+from sensor_msgs.msg import Range
 from cv_bridge import CvBridge
 
-# QoS
-from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSDurabilityPolicy
-
 # Qt
-from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QWidget,
-    QVBoxLayout, QLabel, QHBoxLayout
-)
+from PyQt5.QtWidgets import QApplication, QMainWindow, QWidget, QVBoxLayout, QLabel
 from PyQt5.QtCore import QTimer, Qt
 import pyqtgraph as pg
 import numpy as np
-import cv2
 
-# For map projection (unchanged)
-import requests
-import pyproj
-
+# GPR Protocol Constants
+ACK_HEX = b'007f007f'
 
 class TelemetryGUI(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle('Drone Telemetry')
 
-        # ROS2 init
+        # ROS2 Init
         rclpy.init()
         self.node = Node('telemetry_gui')
         self.executor = SingleThreadedExecutor()
         self.executor.add_node(self.node)
         threading.Thread(target=self.executor.spin, daemon=True).start()
 
-        # Bridge for images
+        # Bridge
         self.bridge = CvBridge()
 
-        # Flight‐path containers
+        # Flight Path Data
         self.path = []
         self.origin = None
 
-        # GPR & laser data
-        self.latest_gpr = None
-        self.latest_range = None
+        # Laser Range
+        self.latest_range = 0.0
+        self.node.create_subscription(Range,
+                                      '/range',
+                                      self.range_cb,
+                                      QoSProfile(depth=10))
 
-        # Establish baseline on first laser reading
-        self.base_range = None
-
-        # How many pixels shift per meter of ground offset
+        # GPR Settings
+        self.host = '192.168.0.10'
+        self.port = 23
+        self.quantity = 1024
+        self.gpr_range = 100
+        self.window_cols = 1000
         self.pix_per_m = 20
 
-        # QoS
-        qos = QoSProfile(depth=10)
-        qos.reliability = QoSReliabilityPolicy.BEST_EFFORT
-        qos.durability = QoSDurabilityPolicy.VOLATILE
+        # Preallocate buffers
+        svc = self.quantity // 16
+        self.n_samples = self.quantity - svc
+        self.data = np.zeros((self.n_samples, self.window_cols), dtype=np.int16)
+        self.range_hist = [0.0]*self.window_cols
+        self.filled = 0
+        self.latest_img = None
+        self.stop_evt = threading.Event()
 
-        # Subscriptions
-        self.node.create_subscription(
-            Image, '/gpr/bscan', self.gpr_cb, qos)
-        self.node.create_subscription(
-            Range, '/range', self.range_cb, qos)
-        self.node.create_subscription(
-            VehicleOdometry,
-            '/fmu/out/vehicle_odometry',
-            self.odom_cb,
-            qos)
+        # Start GPR reader thread
+        self._connect_gpr()
+        threading.Thread(target=self._reader_loop, daemon=True).start()
 
-        # Map background (unchanged except quick OSM)
-        self.map_item = pg.ImageItem()
-        self.map_ready = False
-        self.orig_lat = 37.123456
-        self.orig_lon = -122.123456
-        utm_zone = int((self.orig_lon + 180) / 6) + 1
-        proj_str = f'+proj=utm +zone={utm_zone} +datum=WGS84'
-        self.proj = pyproj.Transformer.from_crs(
-            proj_str, 'EPSG:4326', always_xy=True)
-
-        # ---- Build UI ----
+        # Build UI
         central = QWidget()
         self.setCentralWidget(central)
         layout = QVBoxLayout(central)
 
-        # Flight path + Range label
-        top = QHBoxLayout()
+        # Flight Path plot
         self.plot = pg.PlotWidget(title='Flight Path')
-        self.plot.setAspectLocked(True)
-        self.plot.enableAutoRange()
-        self.plot.addItem(self.map_item)
-        self.map_item.setZValue(-100)
-        self.path_curve = self.plot.plot(
-            [], [], pen=pg.mkPen(width=2, color='w'))
-        top.addWidget(self.plot, stretch=3)
+        self.plot.setBackground('w')
+        self.plot.showGrid(True, True)
+        self.path_curve = self.plot.plot([], [], pen='b')
+        layout.addWidget(self.plot)
 
+        # Range Label
         self.range_label = QLabel('Range: -- m')
         self.range_label.setAlignment(Qt.AlignCenter)
-        top.addWidget(self.range_label, stretch=1)
-        layout.addLayout(top, stretch=1)
+        layout.addWidget(self.range_label)
 
-        # GPR B-scan view
-        self.img_view = pg.ImageView(view=pg.PlotItem())
+        # GPR ImageView
+        self.img_view = pg.ImageView()
         for btn in (self.img_view.ui.histogram,
                     self.img_view.ui.roiBtn,
                     self.img_view.ui.menuBtn):
             btn.hide()
-        v = self.img_view.getView()
-        v.enableAutoRange(False)
-        v.setAspectLocked(False)
-        layout.addWidget(self.img_view, stretch=1)
+        view = self.img_view.getView()
+        view.enableAutoRange(False)
+        view.setAspectLocked(False)
+        layout.addWidget(self.img_view)
 
-        # UI Timer (~30 Hz)
+        # UI Timer
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_ui)
         self.timer.start(33)
 
-    def gpr_cb(self, msg: Image):
-        """Store the latest raw GPR B-scan frame."""
-        self.latest_gpr = self.bridge.imgmsg_to_cv2(msg, 'mono8')
+    def _connect_gpr(self):
+        msg = self._setup_msg(self.quantity, self.gpr_range) + '\n'
+        self.sock = socket.create_connection((self.host, self.port), timeout=5)
+        self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        gc.disable()
+        self.sock.sendall(msg.encode())
+        self.sock.sendall(b'P1\n')
+        ack = self.sock.recv(4)
+        if binascii.hexlify(ack) != ACK_HEX:
+            raise RuntimeError('Bad ACK from GPR')
+        self.sock.recv(1)
+
+    def _setup_msg(self, q, rng):
+        # bit‐build like original
+        m_N, m_00, m_01 = ' ', '1', '1'
+        m_07, m_08_10, m_11_12, m_15 = '0','000','00','0'
+        m_16_19, m_20_21, m_22_31 = '1010','00','1010110010'
+        if q==128: m_05_06='00'
+        elif q==256: m_05_06='10'
+        elif q==512: m_05_06='01'
+        elif q==1024: m_05_06='11'
+        else: m_05_06='01'
+        if rng==25: m_02_04,m_13_14='000','10'
+        elif rng==50: m_02_04,m_13_14='000','00'
+        elif rng==100: m_02_04,m_13_14='100','00'
+        elif rng==200: m_02_04,m_13_14='010','00'
+        elif rng==300: m_02_04,m_13_14='110','00'
+        elif rng==2000: m_02_04,m_13_14='111','00'
+        else: m_02_04,m_13_14='000','00'
+        return ('T'+m_N+m_00+m_01+m_02_04+m_05_06+m_07 +
+                m_08_10+m_11_12+m_13_14+m_15+m_16_19+m_20_21+m_22_31)
+
+    def _reader_loop(self):
+        while not self.stop_evt.is_set():
+            # read raw buffer
+            buf = b''
+            needed = self.quantity*2
+            while len(buf) < needed:
+                chunk = self.sock.recv(needed-len(buf))
+                if not chunk: return
+                buf += chunk
+            trace = np.frombuffer(buf[:self.n_samples*2], dtype='>i2')
+            # roll data
+            if self.filled < self.window_cols:
+                self.data[:,self.filled] = trace
+                self.range_hist[self.filled] = self.latest_range
+                self.filled += 1
+            else:
+                np.roll(self.data, -1, axis=1, out=self.data)
+                self.data[:,-1] = trace
+                self.range_hist.pop(0)
+                self.range_hist.append(self.latest_range)
+            # convert to uint8
+            img = ((self.data.astype(np.int32)+32768) * (255.0/65535.0)).astype(np.uint8)
+            # apply per-column offset
+            adj = np.zeros_like(img)
+            for j in range(img.shape[1]):
+                off = int(self.range_hist[j] * self.pix_per_m)
+                adj[:,j] = np.roll(img[:,j], -off, axis=0)
+            self.latest_img = adj
 
     def range_cb(self, msg: Range):
-        """Store the latest laser range, and establish baseline."""
         self.latest_range = msg.range
-        if self.base_range is None:
-            self.base_range = msg.range
 
     def odom_cb(self, msg: VehicleOdometry):
-        """Record flight path, same as before."""
         if msg.pose_frame == VehicleOdometry.POSE_FRAME_FRD:
-            x, y, _ = msg.position
+            x,y,_ = msg.position
         else:
-            xn, yn, _ = msg.position
-            x, y = yn, xn
+            xn,yn,_ = msg.position; x,y = yn,xn
         if self.origin is None:
-            self.origin = (x, y)
-        xr, yr = x - self.origin[0], y - self.origin[1]
-        w, xq, yq, zq = msg.q
-        yaw = math.atan2(2*(w*zq + xq*yq),
-                         1 - 2*(yq*yq + zq*zq))
-        c, s = math.cos(-yaw), math.sin(-yaw)
-        xr2 = xr*c - yr*s
-        yr2 = xr*s + yr*c
-        self.path.append((xr2, yr2))
-
-    def update_map_background(self):
-        """Fetch OSM static map, unchanged from before."""
-        xs, ys = zip(*self.path)
-        buf = 10.0
-        min_x, max_x = min(xs)-buf, max(xs)+buf
-        min_y, max_y = min(ys)-buf, max(ys)+buf
-        ll_lon, ll_lat = self.proj.transform(min_x, min_y)
-        ur_lon, ur_lat = self.proj.transform(max_x, max_y)
-        center_lat = (ll_lat+ur_lat)/2
-        center_lon = (ll_lon+ur_lon)/2
-        zoom = 15
-        url = (
-            'https://staticmap.openstreetmap.de/staticmap.php'
-            f'?center={center_lat},{center_lon}'
-            f'&zoom={zoom}&size=800x800'
-        )
-        try:
-            resp = requests.get(url, timeout=5)
-            resp.raise_for_status()
-            buf_img = np.frombuffer(resp.content, np.uint8)
-            cv_img = cv2.imdecode(buf_img, cv2.IMREAD_COLOR)
-            rgb = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
-            self.map_item.setImage(rgb)
-            self.map_item.setRect(
-                min_x, min_y, max_x-min_x, max(ys)-min_y)
-            self.map_ready = True
-        except:
-            self.node.get_logger().error('Failed to fetch map')
+            self.origin = (x,y)
+        xr,yr = x-self.origin[0], y-self.origin[1]
+        w,xq,yq,zq = msg.q
+        yaw = math.atan2(2*(w*zq+xq*yq),1-2*(yq*yq+zq*zq))
+        c,s = math.cos(-yaw), math.sin(-yaw)
+        self.path.append((xr*c-yr*s, xr*s+yr*c))
 
     def update_ui(self):
-        """Draw path, range, and GPR B-scan with baseline offset."""
-        # Flight path
-        if not self.map_ready and len(self.path) > 1:
-            self.update_map_background()
+        # plot flight path
         if self.path:
-            xs, ys = zip(*self.path)
-            self.path_curve.setData(xs, ys)
-
-        # Range label
-        if self.latest_range is not None:
-            self.range_label.setText(
-                f'Range: {self.latest_range:.2f} m')
-
-        # GPR B-scan
-        if self.latest_gpr is not None:
-            img = self.latest_gpr
-            if self.latest_range is not None and self.base_range is not None:
-                # offset = difference from baseline
-                delta = self.latest_range - self.base_range
-                shift_px = int(delta * self.pix_per_m)
-                img = np.roll(img, -shift_px, axis=0)
-            disp = img.T
+            xs,ys = zip(*self.path)
+            self.plot.clear(); self.plot.addItem(self.path_curve)
+            self.path_curve.setData(xs,ys)
+        # update range
+        self.range_label.setText(f'Range: {self.latest_range:.2f} m')
+        # show GPR
+        if self.latest_img is not None:
+            disp = self.latest_img.T
             self.img_view.setImage(disp, autoLevels=True)
-            h, w = disp.shape
+            h,w = disp.shape
             v = self.img_view.getView()
-            v.setRange(xRange=(0, w), yRange=(0, h), padding=0)
+            v.setRange(xRange=(0,w), yRange=(0,h), padding=0)
 
     def closeEvent(self, event):
-        """Clean up on exit."""
+        self.stop_evt.set()
+        try: self.sock.close()
+        except: pass
         self.executor.shutdown()
-        self.spin_thread.join(timeout=1.0)
         self.node.destroy_node()
         rclpy.shutdown()
         event.accept()
 
-
-if __name__ == '__main__':
+if __name__=='__main__':
     app = QApplication(sys.argv)
     gui = TelemetryGUI()
     gui.showMaximized()
