@@ -134,33 +134,33 @@ class TelemetryGUI(QMainWindow):
         fy = dx*s + dy*c
         self.path.append((fx, fy))
 
-    def update_ui(self):
-        # flight path
-        if self.path:
-            xs, ys = zip(*self.path)
-            self.path_curve.setData(xs, ys)
+        def update_ui(self):
+        # … flight‐path and range label code …
 
-        # range label
-        if self.latest_range is not None:
-            self.range_label.setText(f'Range: {self.latest_range:.2f} m')
-
-        # gpr data shifting
-        if self.latest_gpr is not None and self.range_hist is not None:
+        if self.latest_gpr is not None:
             img = self.latest_gpr.copy()
-            h, w = img.shape
-            # build a new image by shifting each column
-            shifted = np.zeros_like(img)
-            for j in range(w):
-                # true GPR-to-ground distance at that trace
-                d_gpr = (self.range_hist[j] or 0.0) - self.mount_offset
-                delta  = d_gpr - ((self.base_range or 0.0) - self.mount_offset)
-                off_px = int(delta * self.pix_per_m)
-                shifted[:, j] = np.roll(img[:, j], -off_px, axis=0)
 
-            disp = shifted.T
+            # non‐circular shift so ground stays at top without wrap
+            if self.latest_range is not None and self.base_range is not None:
+                delta = self.latest_range - self.base_range
+                shift = int(delta * self.pix_per_m)
+                h, w = img.shape
+                shifted = np.zeros_like(img)
+                if shift > 0:
+                    n = min(shift, h)
+                    shifted[0:h-n, :] = img[n:, :]
+                elif shift < 0:
+                    n = min(-shift, h)
+                    shifted[n:, :] = img[:h-n, :]
+                else:
+                    shifted = img
+                img = shifted
+
+            disp = img.T
             self.img_view.setImage(disp, autoLevels=True)
+            h2, w2 = disp.shape
             self.img_view.getView().setRange(
-                xRange=(0, w), yRange=(0, h), padding=0)
+                xRange=(0, w2), yRange=(0, h2), padding=0)
 
     def closeEvent(self, event):
         self.executor.shutdown()
