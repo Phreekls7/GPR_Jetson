@@ -1,6 +1,8 @@
+#!/usr/bin/env python3
 import sys
 import threading
 import math
+
 import rclpy
 from rclpy.node import Node
 from rclpy.executors import SingleThreadedExecutor
@@ -14,9 +16,10 @@ from cv_bridge import CvBridge
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSDurabilityPolicy
 
 # Qt
-from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget,
-                             QVBoxLayout, QLabel, QHBoxLayout,
-                             QPushButton)
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget,
+    QVBoxLayout, QLabel, QHBoxLayout
+)
 from PyQt5.QtCore import QTimer, Qt
 import pyqtgraph as pg
 import numpy as np
@@ -36,25 +39,12 @@ class TelemetryGUI(QMainWindow):
         self.node = Node('telemetry_gui')
         self.executor = SingleThreadedExecutor()
         self.executor.add_node(self.node)
-        self.spin_thread = threading.Thread(target=self.executor.spin, daemon=True)
+        self.spin_thread = threading.Thread(
+            target=self.executor.spin, daemon=True)
         self.spin_thread.start()
 
         # Bridge for images
         self.bridge = CvBridge()
-
-        # Running flag
-        self.running = False
-
-        # Subscriptions
-        qos = QoSProfile(depth=10)
-        qos.reliability = QoSReliabilityPolicy.BEST_EFFORT
-        qos.durability = QoSDurabilityPolicy.VOLATILE
-        self.node.create_subscription(Image, '/gpr/bscan', self.gpr_cb, qos_profile=qos)
-        self.node.create_subscription(Range, '/range', self.range_cb, qos_profile=qos)
-        self.node.create_subscription(VehicleOdometry,
-                                      '/fmu/out/vehicle_odometry',
-                                      self.odom_cb,
-                                      qos_profile=qos)
 
         # Data containers
         self.path = []
@@ -62,105 +52,108 @@ class TelemetryGUI(QMainWindow):
         self.latest_gpr = None
         self.latest_range = None
 
+        # How many pixels per meter of range offset
+        self.pix_per_m = 20
+
+        # QoS for subscriptions
+        qos = QoSProfile(depth=10)
+        qos.reliability = QoSReliabilityPolicy.BEST_EFFORT
+        qos.durability = QoSDurabilityPolicy.VOLATILE
+
+        # Subscriptions
+        self.node.create_subscription(
+            Image, '/gpr/bscan', self.gpr_cb, qos)
+        self.node.create_subscription(
+            Range, '/range', self.range_cb, qos)
+        self.node.create_subscription(
+            VehicleOdometry,
+            '/fmu/out/vehicle_odometry',
+            self.odom_cb,
+            qos)
+
         # Map background setup (OpenStreetMap static)
         self.map_item = pg.ImageItem()
         self.map_ready = False
+        # takeoff coords
         self.orig_lat = 37.123456
         self.orig_lon = -122.123456
         utm_zone = int((self.orig_lon + 180) / 6) + 1
         proj_str = f'+proj=utm +zone={utm_zone} +datum=WGS84'
-        self.proj = pyproj.Transformer.from_crs(proj_str, 'EPSG:4326', always_xy=True)
+        self.proj = pyproj.Transformer.from_crs(
+            proj_str, 'EPSG:4326', always_xy=True)
 
         # Build UI
         central = QWidget()
         self.setCentralWidget(central)
         layout = QVBoxLayout(central)
 
-        # Controls: Start / Stop
-        ctrl_layout = QHBoxLayout()
-        self.start_btn = QPushButton('Start')
-        self.start_btn.clicked.connect(self.start_acquisition)
-        ctrl_layout.addWidget(self.start_btn)
-        self.stop_btn = QPushButton('Stop')
-        self.stop_btn.clicked.connect(self.stop_acquisition)
-        self.stop_btn.setEnabled(False)
-        ctrl_layout.addWidget(self.stop_btn)
-        layout.addLayout(ctrl_layout)
-
-        # Top: flight path + range
+        # Flight path + range label
         top = QHBoxLayout()
         self.plot = pg.PlotWidget(title='Flight Path')
         self.plot.setAspectLocked(True)
         self.plot.enableAutoRange()
         self.plot.addItem(self.map_item)
         self.map_item.setZValue(-100)
-        self.path_curve = self.plot.plot([], [], pen=pg.mkPen(width=2, color='w'))
+        self.path_curve = self.plot.plot(
+            [], [], pen=pg.mkPen(width=2, color='w'))
         top.addWidget(self.plot, stretch=3)
+
         self.range_label = QLabel('Range: -- m')
         self.range_label.setAlignment(Qt.AlignCenter)
         top.addWidget(self.range_label, stretch=1)
+
         layout.addLayout(top, stretch=1)
 
-        # Bottom: GPR B-scan view
+        # GPR B-scan view
         self.img_view = pg.ImageView(view=pg.PlotItem())
         for btn in (self.img_view.ui.histogram,
                     self.img_view.ui.roiBtn,
                     self.img_view.ui.menuBtn):
             btn.hide()
-        v = self.img_view.getView()
-        v.enableAutoRange(False)
-        v.setAspectLocked(False)
+        view = self.img_view.getView()
+        view.enableAutoRange(False)
+        view.setAspectLocked(False)
         layout.addWidget(self.img_view, stretch=1)
 
-        # Timer for UI updates
+        # Timer for UI updates (~30 Hz)
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_ui)
-        self.timer.start(30)
-
-    def start_acquisition(self):
-        self.running = True
-        self.start_btn.setEnabled(False)
-        self.stop_btn.setEnabled(True)
-
-    def stop_acquisition(self):
-        self.running = False
-        self.start_btn.setEnabled(True)
-        self.stop_btn.setEnabled(False)
+        self.timer.start(33)
 
     def gpr_cb(self, msg: Image):
-        if not self.running:
-            return
+        """Handle incoming GPR B-scan Image."""
         self.latest_gpr = self.bridge.imgmsg_to_cv2(msg, 'mono8')
 
+    def range_cb(self, msg: Range):
+        """Handle incoming Range message."""
+        self.latest_range = msg.range
+
     def odom_cb(self, msg: VehicleOdometry):
-        if not self.running:
-            return
+        """Handle VehicleOdometry: centering, yaw-rotation."""
         if msg.pose_frame == VehicleOdometry.POSE_FRAME_FRD:
             x, y, _ = msg.position
         else:
-            xn, yn, _ = msg.position; x, y = yn, xn
+            xn, yn, _ = msg.position
+            x, y = yn, xn
         if self.origin is None:
             self.origin = (x, y)
         xr, yr = x - self.origin[0], y - self.origin[1]
         w, xq, yq, zq = msg.q
-        yaw = math.atan2(2*(w*zq + xq*yq), 1 - 2*(yq*yq + zq*zq))
+        yaw = math.atan2(2*(w*zq + xq*yq),
+                         1 - 2*(yq*yq + zq*zq))
         c, s = math.cos(-yaw), math.sin(-yaw)
-        xr2 = xr*c - yr*s; yr2 = xr*s + yr*c
+        xr2 = xr*c - yr*s
+        yr2 = xr*s + yr*c
         self.path.append((xr2, yr2))
 
-    def range_cb(self, msg: Range):
-        if not self.running:
-            return
-        self.latest_range = msg.range
-
     def update_map_background(self):
+        """Fetch and display a simple OSM static map."""
         xs, ys = zip(*self.path)
         buf = 10.0
         min_x, max_x = min(xs)-buf, max(xs)+buf
         min_y, max_y = min(ys)-buf, max(ys)+buf
         ll_lon, ll_lat = self.proj.transform(min_x, min_y)
         ur_lon, ur_lat = self.proj.transform(max_x, max_y)
-        # Use OpenStreetMap static tiles
         center_lat = (ll_lat+ur_lat)/2
         center_lon = (ll_lon+ur_lon)/2
         zoom = 15
@@ -172,39 +165,60 @@ class TelemetryGUI(QMainWindow):
         try:
             resp = requests.get(url, timeout=5)
             resp.raise_for_status()
-            arr = cv2.imdecode(np.frombuffer(resp.content, np.uint8), cv2.IMREAD_COLOR)
-            arr = cv2.cvtColor(arr, cv2.COLOR_BGR2RGB)
-            self.map_item.setImage(arr)
-            self.map_item.setRect(min_x, min_y, max_x-min_x, max_y-min_y)
+            buf_img = np.frombuffer(resp.content, np.uint8)
+            cv_img = cv2.imdecode(buf_img, cv2.IMREAD_COLOR)
+            rgb = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
+            self.map_item.setImage(rgb)
+            self.map_item.setRect(
+                min_x, min_y, max_x-min_x, max_y-min_y)
             self.map_ready = True
         except Exception:
             self.node.get_logger().error('Failed to fetch map')
 
     def update_ui(self):
-        if self.running:
-            if not self.map_ready and len(self.path)>1:
-                self.update_map_background()
-            if self.path:
-                xs, ys = zip(*self.path)
-                self.path_curve.setData(xs, ys)
+        """Update flight path, range label, and GPR B-scan (with offset)."""
+        # Flight path
+        if not self.map_ready and len(self.path) > 1:
+            self.update_map_background()
+        if self.path:
+            xs, ys = zip(*self.path)
+            self.path_curve.setData(xs, ys)
+
+        # Range label
+        if self.latest_range is not None:
+            self.range_label.setText(
+                f'Range: {self.latest_range:.2f} m')
+
+        # GPR B-scan
+        if self.latest_gpr is not None:
+            img_raw = self.latest_gpr
+            # compute vertical offset in pixels
             if self.latest_range is not None:
-                self.range_label.setText(f'Range: {self.latest_range:.2f} m')
-            if self.latest_gpr is not None:
-                img = self.latest_gpr.T
-                self.img_view.setImage(img, autoLevels=True)
-                h, w = img.shape
-                v = self.img_view.getView()
-                v.setRange(xRange=(0,w), yRange=(0,h), padding=0)
+                offset_px = int(self.latest_range * self.pix_per_m)
+                img_shifted = np.roll(img_raw, -offset_px, axis=0)
+            else:
+                img_shifted = img_raw
+            # transpose for display
+            disp = img_shifted.T
+            self.img_view.setImage(disp, autoLevels=True)
+            # lock the view so it doesn't auto-zoom on updates
+            h, w = disp.shape
+            view = self.img_view.getView()
+            view.setRange(xRange=(0, w),
+                          yRange=(0, h),
+                          padding=0)
 
     def closeEvent(self, event):
+        """Cleanup ROS and threads on window close."""
         self.executor.shutdown()
         self.spin_thread.join(timeout=1.0)
         self.node.destroy_node()
         rclpy.shutdown()
         event.accept()
 
-if __name__=='__main__':
+
+if __name__ == '__main__':
     app = QApplication(sys.argv)
-    gui=TelemetryGUI()
+    gui = TelemetryGUI()
     gui.showMaximized()
     sys.exit(app.exec_())
