@@ -4,6 +4,9 @@ import math
 import rclpy
 import pandas as pd
 import matplotlib.pyplot as plt
+import cartopy.crs as ccrs
+import cartopy.io.img_tiles as cimgt
+from geographiclib.geodesic import Geodesic
 from rclpy.node import Node
 from px4_msgs.msg import VehicleOdometry
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
@@ -11,6 +14,10 @@ from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
 class FlightPathPost(Node):
     def __init__(self):
         super().__init__('flight_path_post')
+
+        # static home GPS position (latitude, longitude)
+        self.home_lat = 52.0100  # replace with your take-off lat
+        self.home_lon = 4.3600   # replace with your take-off lon
 
         # parameter for output directory
         self.declare_parameter('output_dir', '/tmp')
@@ -23,15 +30,16 @@ class FlightPathPost(Node):
         self.xs = []
         self.ys = []
         self.zs = []
+        self.lats = []
+        self.lons = []
 
-        # configure QoS to match PX4 publisher (best effort reliability)
+        # configure QoS
         qos = QoSProfile(
             reliability=QoSReliabilityPolicy.BEST_EFFORT,
             history=QoSHistoryPolicy.KEEP_LAST,
             depth=10
         )
-
-        # subscription to PX4 odometry with compatible QoS
+        # subscriber
         self.create_subscription(
             VehicleOdometry,
             '/fmu/out/vehicle_odometry',
@@ -39,48 +47,65 @@ class FlightPathPost(Node):
             qos
         )
 
-        # set up real-time Matplotlib plot
+        # geodetic converter
+        self.geod = Geodesic.WGS84
+
+        # set up tile source and map axes
+        self.tiler = cimgt.OSM()
+        self.fig = plt.figure(figsize=(8, 6))
+        self.ax = plt.axes(projection=self.tiler.crs)
+        # initial extent around home position (±0.005°)
+        margin = 0.005
+        self.ax.set_extent([
+            self.home_lon - margin, self.home_lon + margin,
+            self.home_lat - margin, self.home_lat + margin
+        ], crs=ccrs.PlateCarree())
+        self.ax.add_image(self.tiler, 15)
+
+        # real-time line (in geographic coords)
+        self.line, = self.ax.plot([], [], transform=ccrs.PlateCarree(),
+                                  linewidth=2, marker='o', markersize=3,
+                                  label='Path')
+        plt.title('Real-time Flight Path on OSM')
+        plt.legend(loc='upper left')
         plt.ion()
-        self.fig, self.ax = plt.subplots()
-        self.line, = self.ax.plot([], [], '-o', markersize=3)
-        self.ax.set_title('Real-time Flight Path (Local NED)')
-        self.ax.set_xlabel('North (m)')
-        self.ax.set_ylabel('East (m)')
-        self.ax.grid(True)
-        self.ax.axis('equal')
         plt.show()
 
-        # timer for updating the plot at 10 Hz
-        self.create_timer(0.1, self.update_plot)
-        self.get_logger().info(f"Logging to {self.csv_path} and plotting in real time")
+        # timer to refresh
+        self.create_timer(0.5, self.update_plot)
+        self.get_logger().info("Real-time map display started")
 
     def odom_cb(self, msg: VehicleOdometry):
-        # only log NED-frame data
+        # only NED frame
         if msg.pose_frame != VehicleOdometry.POSE_FRAME_NED:
             return
-        # filter out invalid data
         if any(math.isnan(v) for v in msg.position):
             return
-
-        # timestamp in seconds
+        # timestamp
         t = msg.timestamp * 1e-6
         x, y, z = msg.position
+        # store local NED
         self.times.append(t)
         self.xs.append(x)
         self.ys.append(y)
         self.zs.append(z)
+        # convert to lat/lon
+        az = math.degrees(math.atan2(y, x))
+        dist = math.hypot(x, y)
+        g = self.geod.Direct(self.home_lat, self.home_lon, az, dist)
+        self.lats.append(g['lat2'])
+        self.lons.append(g['lon2'])
 
     def update_plot(self):
-        if not self.xs:
+        if not self.lats:
             return
         # update line data
-        self.line.set_data(self.xs, self.ys)
-        # adjust axes
-        self.ax.relim()
-        self.ax.autoscale_view()
-        # redraw
-        self.fig.canvas.draw()
-        self.fig.canvas.flush_events()
+        self.line.set_data(self.lons, self.lats)
+        # optionally adjust extent dynamically
+        # self.ax.set_extent([min(self.lons), max(self.lons),
+        #                     min(self.lats), max(self.lats)],
+        #                    crs=ccrs.PlateCarree())
+        self.fig.canvas.draw_idle()
 
     def save_csv(self):
         df = pd.DataFrame({
@@ -88,6 +113,8 @@ class FlightPathPost(Node):
             'x_m': self.xs,
             'y_m': self.ys,
             'z_m': self.zs,
+            'lat': self.lats,
+            'lon': self.lons
         })
         df.to_csv(self.csv_path, index=False)
         self.get_logger().info(f"Saved CSV → {self.csv_path}")
@@ -96,7 +123,7 @@ class FlightPathPost(Node):
     def on_shutdown(self):
         df = self.save_csv()
         if df.empty:
-            self.get_logger().warn("No data recorded; skipping CSV save.")
+            self.get_logger().warn("No data recorded.")
 
 
 def main(args=None):
@@ -105,7 +132,7 @@ def main(args=None):
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
-        node.get_logger().info("Shutdown requested, saving data…")
+        node.get_logger().info("Shutting down...")
     finally:
         node.on_shutdown()
         node.destroy_node()
