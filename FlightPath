@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
 import os
 import math
-import webbrowser
-
 import rclpy
 import pandas as pd
-import folium
-from geographiclib.geodesic import Geodesic
+import matplotlib.pyplot as plt
 from rclpy.node import Node
 from px4_msgs.msg import VehicleOdometry
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
@@ -15,17 +12,12 @@ class FlightPathPost(Node):
     def __init__(self):
         super().__init__('flight_path_post')
 
-        # static home GPS position (latitude, longitude)
-        self.home_lat = 52.0100  # replace with your take-off lat
-        self.home_lon = 4.3600   # replace with your take-off lon
-
         # parameter for output directory
         self.declare_parameter('output_dir', '/tmp')
         out_dir = self.get_parameter('output_dir').value
 
         os.makedirs(out_dir, exist_ok=True)
         self.csv_path = os.path.join(out_dir, 'flight_odometry.csv')
-        self.html_path = os.path.join(out_dir, 'flight_path.html')
 
         # storage buffers
         self.times = []
@@ -48,26 +40,19 @@ class FlightPathPost(Node):
             qos
         )
 
-        # geodetic converter
-        self.geod = Geodesic.WGS84
-
-        self.get_logger().info(
-            f"Logging to {self.csv_path}\nHome pos = ({self.home_lat}, {self.home_lon})"
-        )
+        self.get_logger().info(f"Logging to {self.csv_path}")
 
     def odom_cb(self, msg: VehicleOdometry):
-        # filter to NED frame
+        # only log NED-frame data
         if msg.pose_frame != VehicleOdometry.POSE_FRAME_NED:
             return
-        # filter out invalid data
+        # filter invalid positions
         if any(math.isnan(v) for v in msg.position):
             return
 
-        # timestamp in seconds (from microseconds)
+        # timestamp in seconds
         t = msg.timestamp * 1e-6
-        # position in meters: [north, east, down/up]
         x, y, z = msg.position
-
         self.times.append(t)
         self.xs.append(x)
         self.ys.append(y)
@@ -84,33 +69,23 @@ class FlightPathPost(Node):
         self.get_logger().info(f"Saved CSV → {self.csv_path}")
         return df
 
-    def make_map(self, df: pd.DataFrame):
-        # convert NED offsets (north=x, east=y) into geodetic lat/lon
-        lats, lons = [], []
-        for north, east in zip(df.x_m, df.y_m):
-            az = math.degrees(math.atan2(east, north))
-            dist = math.hypot(north, east)
-            g = self.geod.Direct(self.home_lat, self.home_lon, az, dist)
-            lats.append(g['lat2'])
-            lons.append(g['lon2'])
-
-        # create and save interactive map
-        m = folium.Map(location=[lats[0], lons[0]], zoom_start=17)
-        folium.PolyLine(list(zip(lats, lons)), weight=4).add_to(m)
-        folium.Marker([lats[0], lons[0]], popup="Launch").add_to(m)
-        folium.Marker([lats[-1], lons[-1]], popup="Landing").add_to(m)
-        m.save(self.html_path)
-        self.get_logger().info(f"Saved map → {self.html_path}")
-
-        # open in default browser window
-        webbrowser.open('file://' + os.path.abspath(self.html_path))
+    def plot_path(self, df: pd.DataFrame):
+        # simple XY plot of North vs East
+        plt.figure()
+        plt.plot(df['x_m'], df['y_m'], '-o', markersize=3)
+        plt.title('Flight Path (Local NED)')
+        plt.xlabel('North (m)')
+        plt.ylabel('East (m)')
+        plt.axis('equal')
+        plt.grid(True)
+        plt.show()
 
     def on_shutdown(self):
         df = self.save_csv()
         if not df.empty:
-            self.make_map(df)
+            self.plot_path(df)
         else:
-            self.get_logger().warn("No data recorded; skipping map generation.")
+            self.get_logger().warn("No data recorded; skipping plotting.")
 
 
 def main(args=None):
