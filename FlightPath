@@ -6,6 +6,7 @@ import folium
 from geographiclib.geodesic import Geodesic
 from rclpy.node import Node
 from px4_msgs.msg import VehicleOdometry
+from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
 
 class FlightPathPost(Node):
     def __init__(self):
@@ -29,12 +30,19 @@ class FlightPathPost(Node):
         self.ys = []
         self.zs = []
 
-        # subscription to PX4 odometry
+        # configure QoS to match PX4 publisher (best effort reliability)
+        qos = QoSProfile(
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=10
+        )
+
+        # subscription to PX4 odometry with compatible QoS
         self.create_subscription(
             VehicleOdometry,
             '/fmu/out/vehicle_odometry',
             self.odom_cb,
-            10
+            qos
         )
 
         # geodetic converter
