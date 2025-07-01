@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import os
 import math
+import webbrowser
+
 import rclpy
 import pandas as pd
 import folium
@@ -92,12 +94,16 @@ class FlightPathPost(Node):
             lats.append(g['lat2'])
             lons.append(g['lon2'])
 
+        # create and save interactive map
         m = folium.Map(location=[lats[0], lons[0]], zoom_start=17)
         folium.PolyLine(list(zip(lats, lons)), weight=4).add_to(m)
         folium.Marker([lats[0], lons[0]], popup="Launch").add_to(m)
         folium.Marker([lats[-1], lons[-1]], popup="Landing").add_to(m)
         m.save(self.html_path)
         self.get_logger().info(f"Saved map → {self.html_path}")
+
+        # open in default browser window
+        webbrowser.open('file://' + os.path.abspath(self.html_path))
 
     def on_shutdown(self):
         df = self.save_csv()
