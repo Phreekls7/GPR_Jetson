@@ -15,7 +15,6 @@ class FlightPathPost(Node):
         # parameter for output directory
         self.declare_parameter('output_dir', '/tmp')
         out_dir = self.get_parameter('output_dir').value
-
         os.makedirs(out_dir, exist_ok=True)
         self.csv_path = os.path.join(out_dir, 'flight_odometry.csv')
 
@@ -40,13 +39,26 @@ class FlightPathPost(Node):
             qos
         )
 
-        self.get_logger().info(f"Logging to {self.csv_path}")
+        # set up real-time Matplotlib plot
+        plt.ion()
+        self.fig, self.ax = plt.subplots()
+        self.line, = self.ax.plot([], [], '-o', markersize=3)
+        self.ax.set_title('Real-time Flight Path (Local NED)')
+        self.ax.set_xlabel('North (m)')
+        self.ax.set_ylabel('East (m)')
+        self.ax.grid(True)
+        self.ax.axis('equal')
+        plt.show()
+
+        # timer for updating the plot at 10 Hz
+        self.create_timer(0.1, self.update_plot)
+        self.get_logger().info(f"Logging to {self.csv_path} and plotting in real time")
 
     def odom_cb(self, msg: VehicleOdometry):
         # only log NED-frame data
         if msg.pose_frame != VehicleOdometry.POSE_FRAME_NED:
             return
-        # filter invalid positions
+        # filter out invalid data
         if any(math.isnan(v) for v in msg.position):
             return
 
@@ -57,6 +69,18 @@ class FlightPathPost(Node):
         self.xs.append(x)
         self.ys.append(y)
         self.zs.append(z)
+
+    def update_plot(self):
+        if not self.xs:
+            return
+        # update line data
+        self.line.set_data(self.xs, self.ys)
+        # adjust axes
+        self.ax.relim()
+        self.ax.autoscale_view()
+        # redraw
+        self.fig.canvas.draw()
+        self.fig.canvas.flush_events()
 
     def save_csv(self):
         df = pd.DataFrame({
@@ -69,23 +93,10 @@ class FlightPathPost(Node):
         self.get_logger().info(f"Saved CSV → {self.csv_path}")
         return df
 
-    def plot_path(self, df: pd.DataFrame):
-        # simple XY plot of North vs East
-        plt.figure()
-        plt.plot(df['x_m'], df['y_m'], '-o', markersize=3)
-        plt.title('Flight Path (Local NED)')
-        plt.xlabel('North (m)')
-        plt.ylabel('East (m)')
-        plt.axis('equal')
-        plt.grid(True)
-        plt.show()
-
     def on_shutdown(self):
         df = self.save_csv()
-        if not df.empty:
-            self.plot_path(df)
-        else:
-            self.get_logger().warn("No data recorded; skipping plotting.")
+        if df.empty:
+            self.get_logger().warn("No data recorded; skipping CSV save.")
 
 
 def main(args=None):
@@ -94,7 +105,7 @@ def main(args=None):
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
-        node.get_logger().info("Shutdown requested, processing data…")
+        node.get_logger().info("Shutdown requested, saving data…")
     finally:
         node.on_shutdown()
         node.destroy_node()
