@@ -9,26 +9,12 @@ from rclpy.node import Node
 from px4_msgs.msg import VehicleOdometry
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
 
-# Attempt to import Cartopy for map background
-try:
-    import cartopy.crs as ccrs
-    import cartopy.io.img_tiles as cimgt
-    HAS_CARTOPY = True
-except ImportError:
-    HAS_CARTOPY = False
-    print("Warning: Cartopy or its dependencies not installed; falling back to simple plot.")
+# Force simple local NED plot to avoid Cartopy issues
+HAS_CARTOPY = False
 
 class FlightPathPost(Node):
     def __init__(self):
         super().__init__('flight_path_post')
-
-        # static home GPS position (latitude, longitude)
-        self.home_lat = 52.0100  # replace with your take-off latitude
-        self.home_lon = 4.3600   # replace with your take-off longitude
-
-        # map margin for geographic view (degrees)
-        self.declare_parameter('map_margin', 0.01)
-        self.margin = self.get_parameter('map_margin').value
 
         # output directory for CSV
         self.declare_parameter('output_dir', '/tmp')
@@ -41,8 +27,6 @@ class FlightPathPost(Node):
         self.xs = []
         self.ys = []
         self.zs = []
-        self.lats = []
-        self.lons = []
 
         # QoS matching PX4 (best effort)
         qos = QoSProfile(
@@ -59,41 +43,20 @@ class FlightPathPost(Node):
             qos
         )
 
-        # geodesic converter
-        self.geod = Geodesic.WGS84
-
-        # set up plotting
+        # prepare Matplotlib interactive plot
         plt.ion()
         self.fig, self.ax = plt.subplots()
-        if HAS_CARTOPY:
-            # Cartopy map background
-            tiler = cimgt.OSM()
-            self.ax = plt.axes(projection=tiler.crs)
-            self.ax.add_image(tiler, 15)
-            # geographic extent around home
-            lon_min = self.home_lon - self.margin
-            lon_max = self.home_lon + self.margin
-            lat_min = self.home_lat - self.margin
-            lat_max = self.home_lat + self.margin
-            self.ax.set_extent([lon_min, lon_max, lat_min, lat_max], crs=ccrs.PlateCarree())
-            # line in geographic coords
-            self.line, = self.ax.plot([], [], transform=ccrs.PlateCarree(),
-                                      linewidth=2, marker='o', markersize=3)
-            self.ax.set_title('Real-time Flight Path on Map')
-        else:
-            # simple XY plot
-            self.line, = self.ax.plot([], [], '-o', markersize=3)
-            self.ax.set_title('Real-time Flight Path (Local NED)')
-            self.ax.set_xlabel('North (m)')
-            self.ax.set_ylabel('East (m)')
-            self.ax.grid(True)
-            self.ax.axis('equal')
-
+        self.line, = self.ax.plot([], [], '-o', markersize=4)
+        self.ax.set_title('Real-time Flight Path (Local NED)')
+        self.ax.set_xlabel('North (m)')
+        self.ax.set_ylabel('East (m)')
+        self.ax.grid(True)
+        self.ax.axis('equal')
         plt.show()
 
-        # timer to update at 10Hz
+        # timer to update at 10 Hz
         self.create_timer(0.1, self.update_plot)
-        print(f"Node started. Real-time display {'with map' if HAS_CARTOPY else 'without map'}.")
+        print("Node started. Plotting real-time NED flight path.")
 
     def odom_cb(self, msg: VehicleOdometry):
         # only NED
@@ -103,33 +66,24 @@ class FlightPathPost(Node):
         if any(math.isnan(v) for v in msg.position):
             return
 
-        # record timestamp and NED
-        t = msg.timestamp * 1e-6
+        t = msg.timestamp * 1e-6  # seconds
         x, y, z = msg.position
         self.times.append(t)
         self.xs.append(x)
         self.ys.append(y)
         self.zs.append(z)
 
-        # geographic conversion
-        az = math.degrees(math.atan2(y, x))
-        dist = math.hypot(x, y)
-        geo = self.geod.Direct(self.home_lat, self.home_lon, az, dist)
-        self.lats.append(geo['lat2'])
-        self.lons.append(geo['lon2'])
-
     def update_plot(self):
         if not self.xs:
             return
-        if HAS_CARTOPY:
-            # plot geographic
-            self.line.set_data(self.lons, self.lats)
-        else:
-            # plot local NED
-            self.line.set_data(self.xs, self.ys)
+        # update data
+        self.line.set_data(self.xs, self.ys)
+        # adjust axes limits dynamically
         self.ax.relim()
         self.ax.autoscale_view()
-        self.fig.canvas.draw_idle()
+        # redraw and pause briefly
+        self.fig.canvas.draw()
+        plt.pause(0.001)
 
     def save_csv(self):
         df = pd.DataFrame({
@@ -137,8 +91,6 @@ class FlightPathPost(Node):
             'x_m': self.xs,
             'y_m': self.ys,
             'z_m': self.zs,
-            'lat': self.lats,
-            'lon': self.lons
         })
         df.to_csv(self.csv_path, index=False)
         print(f"Saved CSV → {self.csv_path}")
