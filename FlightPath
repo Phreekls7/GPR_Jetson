@@ -7,6 +7,7 @@ from geographiclib.geodesic import Geodesic
 from rclpy.node import Node
 from px4_msgs.msg import VehicleOdometry
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
+import math
 
 class FlightPathPost(Node):
     def __init__(self):
@@ -53,7 +54,8 @@ class FlightPathPost(Node):
         )
 
     def odom_cb(self, msg: VehicleOdometry):
-        t = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+        # timestamp in microseconds since system start
+        t = msg.timestamp * 1e-6
         self.times.append(t)
         self.xs.append(msg.x)
         self.ys.append(msg.y)
@@ -74,8 +76,8 @@ class FlightPathPost(Node):
         # convert NED offsets (north=x, east=y) into geodetic lat/lon
         lats, lons = [], []
         for north, east in zip(df.x_m, df.y_m):
-            az = (180.0 / 3.141592653589793) * __import__('math').atan2(east, north)
-            dist = (north**2 + east**2)**0.5
+            az = math.degrees(math.atan2(east, north))
+            dist = math.hypot(north, east)
             g = self.geod.Direct(self.home_lat, self.home_lon, az, dist)
             lats.append(g['lat2'])
             lons.append(g['lon2'])
